@@ -567,3 +567,18 @@ partir de una línea de comandos o de un fichero YAML.
   Validado con Docker (API + 3 workers + PostgreSQL 17 + Redis 7): 24/24
   comprobaciones de extremo a extremo, 15 trabajos repartidos sin duplicados,
   Redis caído sin errores (fallback a memoria) y healthchecks correctos.
+
+
+--------------------------------------------------------------------------------
+14. PROBAR LA API DESDE POSTMAN
+--------------------------------------------------------------------------------
+
+  Importa docs/postman/API.postman_collection.json (File > Import).
+  1. Variables de la colección: baseUrl, apiPrefix, email, password
+     (escríbelos en "Current value": no se sincronizan con la nube).
+  2. Auth > Login (x-www-form-urlencoded): guarda access y refresh token.
+  3. Todas las peticiones heredan "Bearer {{accessToken}}"; un script de la
+     colección renueva el token automáticamente 30 s antes de que caduque.
+  Incluye registro, login de solo lectura (scope=read), refresh, logout,
+  logout-all, jobs y health. Verificada con newman contra la API real. Los
+  proyectos nuevos la incluyen y apigen docs la menciona en el README del cliente.

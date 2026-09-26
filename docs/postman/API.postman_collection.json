@@ -1,0 +1,625 @@
+{
+  "info": {
+    "_postman_id": "852cbd02-9823-48b6-94dc-d0ea5b796dc7",
+    "name": "API (FastAPI + JWT)",
+    "description": "Colección base para las APIs creadas con la plantilla.\n\n1. Ajusta las variables de la colección `baseUrl`, `apiPrefix`, `email` y `password` (usa **Current value**, no se sincroniza).\n2. Ejecuta **Auth > Login**: los tokens se guardan solos.\n3. El resto de peticiones heredan `Bearer {{accessToken}}` y el token se renueva automáticamente antes de caducar.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{accessToken}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Renovación automática: si el access token caduca en menos de 30 s y hay refresh token,",
+          "// se pide un par nuevo antes de enviar la petición (excepto en /auth/ y /health/).",
+          "const url = pm.request.url.toString();",
+          "const exp = Number(pm.collectionVariables.get(\"accessTokenExpiresAt\") || 0);",
+          "const refresh = pm.collectionVariables.get(\"refreshToken\");",
+          "if (!url.includes(\"/auth/\") && !url.includes(\"/health/\") && refresh && Date.now() > exp - 30000) {",
+          "  pm.sendRequest({",
+          "    url: pm.variables.get(\"baseUrl\") + pm.variables.get(\"apiPrefix\") + \"/auth/refresh\",",
+          "    method: \"POST\",",
+          "    header: { \"Content-Type\": \"application/json\" },",
+          "    body: { mode: \"raw\", raw: JSON.stringify({ refresh_token: refresh }) }",
+          "  }, (err, res) => {",
+          "    if (!err && res.code === 200) {",
+          "      const d = res.json();",
+          "      pm.collectionVariables.set(\"accessToken\", d.access_token);",
+          "      pm.collectionVariables.set(\"refreshToken\", d.refresh_token);",
+          "      pm.collectionVariables.set(\"accessTokenExpiresAt\", String(Date.now() + d.expires_in * 1000));",
+          "      console.log(\"Token renovado automáticamente\");",
+          "    } else {",
+          "      console.warn(\"Refresh automático falló: vuelve a ejecutar Auth > Login\", err || (res && res.code));",
+          "    }",
+          "  });",
+          "}"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8000"
+    },
+    {
+      "key": "apiPrefix",
+      "value": "/api/v1"
+    },
+    {
+      "key": "email",
+      "value": "usuario@example.com"
+    },
+    {
+      "key": "password",
+      "value": "",
+      "type": "secret"
+    },
+    {
+      "key": "accessToken",
+      "value": "",
+      "type": "secret"
+    },
+    {
+      "key": "refreshToken",
+      "value": "",
+      "type": "secret"
+    },
+    {
+      "key": "accessTokenExpiresAt",
+      "value": "0"
+    },
+    {
+      "key": "jobId",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Register",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/auth/register",
+              "host": [
+                "{{baseUrl}}{{apiPrefix}}/auth/register"
+              ]
+            },
+            "description": "Crea una cuenta (JSON). Contraseña: 12+ caracteres, sin contener tu email.",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\",\n  \"full_name\": \"Nombre Apellido\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/auth/login",
+              "host": [
+                "{{baseUrl}}{{apiPrefix}}/auth/login"
+              ]
+            },
+            "description": "OAuth2 password flow: **x-www-form-urlencoded** (no JSON). Guarda access y refresh token.",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "username",
+                  "value": "{{email}}",
+                  "type": "text"
+                },
+                {
+                  "key": "password",
+                  "value": "{{password}}",
+                  "type": "text"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Guarda los tokens en variables de la colección para las siguientes peticiones.",
+                  "if (pm.response.code === 200) {",
+                  "  const d = pm.response.json();",
+                  "  pm.collectionVariables.set(\"accessToken\", d.access_token);",
+                  "  pm.collectionVariables.set(\"refreshToken\", d.refresh_token);",
+                  "  pm.collectionVariables.set(\"accessTokenExpiresAt\", String(Date.now() + d.expires_in * 1000));",
+                  "}",
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Me",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/users/me",
+              "host": [
+                "{{baseUrl}}{{apiPrefix}}/users/me"
+              ]
+            },
+            "description": "Comprueba que el token funciona."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Refresh",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/auth/refresh",
+              "host": [
+                "{{baseUrl}}{{apiPrefix}}/auth/refresh"
+              ]
+            },
+            "description": "Rota el refresh token: el anterior deja de valer. 409 `refresh_token_rotated` = otra pestaña ya lo renovó.",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{refreshToken}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Guarda los tokens en variables de la colección para las siguientes peticiones.",
+                  "if (pm.response.code === 200) {",
+                  "  const d = pm.response.json();",
+                  "  pm.collectionVariables.set(\"accessToken\", d.access_token);",
+                  "  pm.collectionVariables.set(\"refreshToken\", d.refresh_token);",
+                  "  pm.collectionVariables.set(\"accessTokenExpiresAt\", String(Date.now() + d.expires_in * 1000));",
+                  "}",
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login (solo lectura)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/auth/login",
+              "host": [
+                "{{baseUrl}}{{apiPrefix}}/auth/login"
+              ]
+            },
+            "description": "Token con `scope=read`: no puede crear, modificar ni borrar (403).",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "username",
+                  "value": "{{email}}",
+                  "type": "text"
+                },
+                {
+                  "key": "password",
+                  "value": "{{password}}",
+                  "type": "text"
+                },
+                {
+                  "key": "scope",
+                  "value": "read",
+                  "type": "text"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Guarda los tokens en variables de la colección para las siguientes peticiones.",
+                  "if (pm.response.code === 200) {",
+                  "  const d = pm.response.json();",
+                  "  pm.collectionVariables.set(\"accessToken\", d.access_token);",
+                  "  pm.collectionVariables.set(\"refreshToken\", d.refresh_token);",
+                  "  pm.collectionVariables.set(\"accessTokenExpiresAt\", String(Date.now() + d.expires_in * 1000));",
+                  "}",
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Logout (esta sesión)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/auth/logout",
+              "host": [
+                "{{baseUrl}}{{apiPrefix}}/auth/logout"
+              ]
+            },
+            "description": "Revoca el refresh token (cierra esta sesión). El access token vigente sigue valiendo hasta su caducidad (máx. 15 min).",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{refreshToken}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('refreshToken', '');",
+                  "pm.test(\"status 204\", () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Logout de todas las sesiones",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/auth/logout-all",
+              "host": [
+                "{{baseUrl}}{{apiPrefix}}/auth/logout-all"
+              ]
+            },
+            "description": "Invalida al instante TODOS los tokens del usuario (útil si se sospecha robo)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('refreshToken', '');",
+                  "pm.collectionVariables.set('accessToken', '');",
+                  "pm.test(\"status 204\", () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Recursos (ejemplo)",
+      "item": [
+        {
+          "name": "Listar",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/<recurso>?limit=20&offset=0&order_by=-created_at",
+              "host": [
+                "{{baseUrl}}{{apiPrefix}}/<recurso>?limit=20&offset=0&order_by=-created_at"
+              ]
+            },
+            "description": "Sustituye `<recurso>` (p. ej. `courses`). Respuesta: `{items, total, limit, offset}`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Crear",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/<recurso>",
+              "host": [
+                "{{baseUrl}}{{apiPrefix}}/<recurso>"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"campo\": \"valor\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Acción en segundo plano",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/<recurso>/<id>/<accion>",
+              "host": [
+                "{{baseUrl}}{{apiPrefix}}/<recurso>/<id>/<accion>"
+              ]
+            },
+            "description": "Responde 202 con `job_id` y `status_url`. Luego: Jobs > Estado del trabajo.",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 202) { pm.collectionVariables.set('jobId', pm.response.json().job_id); }",
+                  "pm.test(\"status 202\", () => pm.response.to.have.status(202));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Jobs",
+      "item": [
+        {
+          "name": "Mis trabajos",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/jobs",
+              "host": [
+                "{{baseUrl}}{{apiPrefix}}/jobs"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Estado del trabajo",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/jobs/{{jobId}}",
+              "host": [
+                "{{baseUrl}}{{apiPrefix}}/jobs/{{jobId}}"
+              ]
+            },
+            "description": "`queued` → `running` → `succeeded` (ver `result`) / `failed` (ver `error`) / `cancelled`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cancelar trabajo",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}{{apiPrefix}}/jobs/{{jobId}}/cancel",
+              "host": [
+                "{{baseUrl}}{{apiPrefix}}/jobs/{{jobId}}/cancel"
+              ]
+            },
+            "description": "Solo si sigue en `queued` (si no, 409)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Live",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health/live",
+              "host": [
+                "{{baseUrl}}/health/live"
+              ]
+            },
+            "description": "",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Ready (BD)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health/ready",
+              "host": [
+                "{{baseUrl}}/health/ready"
+              ]
+            },
+            "description": "",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

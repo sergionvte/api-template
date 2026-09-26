@@ -818,6 +818,24 @@ def readme_settings(base: Path) -> dict[str, str]:
     return found
 
 
+_POSTMAN = {
+    "en": (
+        "### Postman\n\n"
+        "Import `docs/postman/API.postman_collection.json` into Postman. Set the collection "
+        "variables `baseUrl`, `email` and `password` (use *Current value*), run **Auth > Login** "
+        "and every other request is sent with `Bearer {{accessToken}}`; the token is refreshed "
+        "automatically before it expires.\n"
+    ),
+    "es": (
+        "### Postman\n\n"
+        "Importa `docs/postman/API.postman_collection.json` en Postman. Ajusta las variables de la "
+        "colección `baseUrl`, `email` y `password` (en *Current value*), ejecuta **Auth > Login** "
+        "y el resto de peticiones van con `Bearer {{accessToken}}`; el token se renueva solo "
+        "antes de caducar.\n"
+    ),
+}
+
+
 def render_docs(base: Path, lang: str = "en", base_url: str = DEFAULT_BASE_URL) -> str:
     """Contenido generado (entre marcadores)."""
     t = T[lang]
@@ -853,6 +871,8 @@ def render_docs(base: Path, lang: str = "en", base_url: str = DEFAULT_BASE_URL) 
             p=p, access=access, refresh=env.get("REFRESH_TOKEN_EXPIRE_DAYS", "7")
         )
     )
+    if (base / "docs/postman/API.postman_collection.json").exists():
+        parts.append(_POSTMAN[lang])
     parts.append(f"### {t['pagination']}\n\n" + t["pagination_body"].format(**page))
     err = "\n".join(f"| {a} | `{b}` | {c} |" for a, b, c in t["err_rows"])
     parts.append(

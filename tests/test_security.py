@@ -502,3 +502,32 @@ async def test_invalid_host_is_json_with_code(monkeypatch):
     async with httpx.AsyncClient(transport=transport, base_url="http://example.org") as c:
         redirect = await c.get("/health/live")
     assert redirect.status_code == 307
+
+
+async def test_nul_in_query_or_path_is_422_not_500(client, admin_headers):
+    """Validación con Docker + PostgreSQL: un %00 en la query llegaba a la BD (500)."""
+    for url in ("/api/v1/users?q=a%00b", "/api/v1/users/abc%00def", "/api/v1/jobs?name=%00"):
+        r = await client.get(url, headers=admin_headers)
+        assert r.status_code == 422, (url, r.text)
+        assert r.json()["detail"][0]["type"] == "null_character"
+        assert r.headers["x-content-type-options"] == "nosniff"  # sigue pasando por seguridad
+
+
+async def test_nul_422_has_cors_headers_and_right_loc(monkeypatch):
+    """Ronda 7: el 422 del NUL iba por fuera de CORS (el navegador veía un error de red)
+    y decía `loc: ["query"]` también con el NUL en la ruta."""
+    import httpx
+
+    from app.core.config import Environment
+    from app.main import create_app
+
+    monkeypatch.setattr(settings, "ENVIRONMENT", Environment.development)
+    transport = httpx.ASGITransport(app=create_app())
+    origin = {"Origin": "http://localhost:3000"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        in_query = await c.get("/api/v1/jobs?name=%00", headers=origin)
+        in_path = await c.get("/api/v1/jobs/abc%00", headers=origin)
+    for r, where in ((in_query, "query"), (in_path, "path")):
+        assert r.status_code == 422
+        assert r.headers["access-control-allow-origin"] == "http://localhost:3000"
+        assert r.json()["detail"][0]["loc"] == [where]

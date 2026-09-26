@@ -166,7 +166,9 @@ _FOREIGN_PARAMS = {
     "per_page": "use limit",
     "page_size": "use limit",
     "sort": "use order_by",
+    "sort_by": "use order_by",
     "order": "use order_by",
+    "ordering": "use order_by",  # la clave del YAML se llama así (UX-60)
     "search": "use q",
 }
 

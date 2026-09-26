@@ -16,6 +16,7 @@ Documentación: `README.txt` (repo), `guia/README.txt` (uso), `security/REVISION
 - Lógica de negocio de un recurso: `app/hooks/<recurso>.py` (apigen nunca lo pisa).
   Procesos pesados: acciones `background: true` en el YAML → `app/tasks/resources/`
   y `apigen worker` (cola en la tabla `jobs`, sin broker). Tests: `process_pending()`.
+- Nuevos proyectos: `make new-api NAME=x` (scripts/new_api.py). README.md para clientes: `apigen docs`.
 - Agentes de revisión en `.claude/agents/` (security-expert, developer, user);
   laboratorio aislado: `./security/lab.sh <puerto>`.
 - No reintroducir `SlowAPIMiddleware`: con FastAPI >= 0.140 no aplica límites

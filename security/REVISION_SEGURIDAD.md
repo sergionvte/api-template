@@ -133,3 +133,19 @@ La sesión principal verificó después: 132 tests, ruff limpio, `pip-audit` sin
 - Anillo de claves asimétricas; protección del último admin con `SELECT … FOR UPDATE`.
 - Digests de imagen, usuario de BD separado para migraciones, `requirepass` en Redis.
 - `unique: global` en recursos *owned*; excluir `json`/`text` de los listados.
+
+---
+
+## Rondas 5–8 (2026-09-26): revisión completa con graphify y funcionalidades nuevas
+
+| Ronda | Quién | Resultado |
+|---|---|---|
+| 5 | Experto + usuario (guiados por el grafo) | Experto: 0 críticos, 0 altos y 0 medios; 3 bajos; 49 comprobaciones OK. Usuario: **9/10** |
+| 6 | Desarrollador | SEC-30 (último admin), el soft delete respeta `on_delete`, la carga no usa BD heredada, documentación de graphify · 151 tests |
+| — | Sesión principal | Hooks, acciones y cola de trabajos (`apigen worker`) · **validación con Docker** (PostgreSQL + Redis): 24/24, corregido NUL en query (500 → 422) y healthcheck del worker · `scripts/new_api.py` · `apigen docs` |
+| 7 | Experto + usuario | Experto: 0 críticos y 0 altos; **4 medios**: SEC-31 (alias de permisos pisados por acciones), SEC-32 (BOLA en acciones de recursos owned), SEC-33 (los timeouts no detenían tareas thread/process), SEC-35 (el script copiaba ficheros sin versionar). Usuario: 9/10 global, 8/10 en el flujo de cliente |
+| 8 | Desarrollador | Todo lo medio corregido con tests: nombres de acción reservados y alias propios, acciones owned=user solo con `shared_read`, un proceso por tarea que se mata al vencer el timeout, el script copia solo lo versionado y busca secretos antes del commit. README para clientes con guía de integración · **205 tests** (generados: 233 shop / 238 cursos) |
+
+**Pospuesto o aceptado en la ronda 8:**
+- `response_model` opcional por acción;
+- el límite de trabajos pendientes en SQLite puede pasarse un poco en ráfagas (en PostgreSQL está serializado por usuario).

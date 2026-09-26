@@ -1,7 +1,8 @@
-# Entorno completo: API + PostgreSQL + Redis, siempre en modo producción.
-#   apigen init-env --production   (genera SECRET_KEY y POSTGRES_PASSWORD)
-#   edita .env: ALLOWED_HOSTS (obligatorio), CORS_ORIGINS...
-#   docker compose up --build
+# Entorno completo: API + worker + PostgreSQL + Redis, siempre en modo producción.
+#   cp .env.example .env  (o `apigen init-env --production`, que rellena los secretos)
+#   edita .env: SECRET_KEY (`openssl rand -base64 48`), POSTGRES_PASSWORD
+#   (`openssl rand -hex 24`), ALLOWED_HOSTS (obligatorio), CORS_ORIGINS...
+#   docker compose up -d --build
 # Pon delante un proxy inverso con HTTPS que envíe X-Forwarded-For/-Proto.
 services:
   api:
@@ -41,10 +42,24 @@ services:
     environment:
       ENVIRONMENT: production
       DATABASE_URL: postgresql+asyncpg://api:${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}@db:5432/api
-      RATE_LIMIT_STORAGE_URI: redis://redis:6379/0?socket_timeout=0.5&socket_connect_timeout=0.5
+      # Mínimo privilegio (SEC-38): el worker no firma ni valida tokens, así que no
+      # recibe la clave de los JWT. Si una tarea tuya la necesita, quita estas líneas.
+      PROCESS_ROLE: worker
+      SECRET_KEY: ""
+      JWT_PREVIOUS_SECRET_KEYS: ""
+      JOBS_HEARTBEAT_FILE: /tmp/apigen-worker.heartbeat
+    # El worker no sirve HTTP: en vez del healthcheck de la imagen (/health/live) se
+    # comprueba su latido, que solo se escribe mientras la BD responde (SEC-39).
+    # Ojo: sin orquestador, "unhealthy" no reinicia el contenedor (solo lo señala).
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time() - os.path.getmtime('/tmp/apigen-worker.heartbeat') < 60 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
     depends_on:
       db: {condition: service_healthy}
-      api: {condition: service_started}  # la API aplica las migraciones al arrancar
+      api: {condition: service_healthy}  # la API aplica las migraciones al arrancar
     read_only: true
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]

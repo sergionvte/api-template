@@ -3,6 +3,7 @@
 import random
 import string
 import uuid
+from datetime import UTC, date, datetime, timedelta
 
 
 def _uid() -> str:
@@ -34,3 +35,14 @@ def _like(example: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+def _future_date(offset: int = 0) -> str:
+    """Fecha ISO dentro de un año (+offset días): válida para reglas tipo "no en el pasado"."""
+    return (date.today() + timedelta(days=365 + offset)).isoformat()
+
+
+def _future_datetime(offset: int = 0) -> str:
+    """Fecha y hora ISO con zona, dentro de un año (+offset días), a las 10:00 UTC."""
+    moment = datetime.now(UTC) + timedelta(days=365 + offset)
+    return moment.replace(hour=10, minute=0, second=0, microsecond=0).isoformat()

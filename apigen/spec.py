@@ -289,11 +289,16 @@ class RateLimits(BaseModel):
         return value
 
 
-# Nombres que chocarían con lo que ya definen los módulos de hooks/tareas generados.
+# Nombres que chocarían con lo que ya definen los módulos de hooks/tareas generados
+# o con las operaciones CRUD del router (SEC-31: una acción `read` redefinía el
+# permiso de `GET /{id}`; `get`/`create`... repetirían el nombre de su función).
 RESERVED_ACTIONS = {
     "task", "uuid", "annotations", "before_create", "after_create", "before_update",
-    "after_update", "before_delete", "after_delete",
+    "after_update", "before_delete", "after_delete", *ACTIONS, "get",
 }  # fmt: skip
+# Atributos de pydantic.BaseModel: un campo de entrada con ese nombre rompe el esquema
+# (`model_config`, `model_dump`...) o lo ensombrece (`json`, `copy`...). SEC-38.
+_BASEMODEL_ATTRS = {name for name in dir(BaseModel) if not name.startswith("_")}
 ACTION_FIELD_TYPES = {
     "str", "text", "int", "float", "decimal", "bool", "date", "datetime", "uuid", "email", "json",
 }  # fmt: skip
@@ -341,7 +346,13 @@ class ActionSpec(BaseModel):
     @model_validator(mode="after")
     def _check(self) -> ActionSpec:
         for fname, f in self.fields.items():
-            if not IDENT.match(fname) or keyword.iskeyword(fname) or fname in {"item_id"}:
+            if (
+                not IDENT.match(fname)
+                or keyword.iskeyword(fname)
+                or fname == "item_id"
+                or fname.startswith("model_")
+                or fname in _BASEMODEL_ATTRS
+            ):
                 raise ValueError(f"acción {self.name}: campo no permitido {fname!r}")
             if f.type not in ACTION_FIELD_TYPES:
                 raise ValueError(
@@ -482,6 +493,23 @@ class ResourceSpec(BaseModel):
                 )
             if action.background and action.permission == "public":
                 raise ValueError(f"acción {action.name}: en segundo plano no puede ser pública")
+            # SEC-32: en un recurso owned, una acción de item abierta a cualquier usuario
+            # cargaría filas ajenas (BOLA), igual que update/delete='user'. Solo se admite
+            # si las filas son legibles por todos a propósito (shared_read + read abierto).
+            if (
+                self.owned
+                and action.scope == "item"
+                and action.permission in {"public", "user"}
+                and not (
+                    self.shared_read and _LEVEL_ORDER[p.read] <= _LEVEL_ORDER[action.permission]
+                )
+            ):
+                raise ValueError(
+                    f"acción {action.name}: en un recurso owned, permission={action.permission} "
+                    "dejaría actuar sobre filas ajenas (BOLA). Usa 'owner' (el dueño; admins: "
+                    "cualquiera) o 'admin'. Solo si todos pueden ver todas las filas, añade "
+                    f"`shared_read: true` con read={action.permission}"
+                )
         return self
 
     def warnings(self) -> list[str]:
@@ -504,6 +532,23 @@ class ResourceSpec(BaseModel):
                 f"{self.name}: read={p.read} es más permisivo que list={p.list}: quien no ve "
                 "una fila en el listado puede leerla por su ID"
             )
+        for action in self.actions:
+            if action.scope == "item" and self.owned and action.permission in {"public", "user"}:
+                out.append(
+                    f"{self.name}.{action.name}: permission={action.permission} con shared_read -> "
+                    "cualquier usuario ejecuta la acción sobre filas de otros"
+                )
+            if action.background and not action.rate_limit and action.permission != "admin":
+                out.append(
+                    f"{self.name}.{action.name}: acción en segundo plano sin rate_limit (solo "
+                    "aplica el límite por defecto); añade p. ej. `rate_limit: 10/minute`"
+                )
+            inherited = "permission" not in action.model_fields_set
+            if action.scope == "collection" and action.permission == "public" and inherited:
+                out.append(
+                    f"{self.name}.{action.name}: acción pública heredada de create=public "
+                    "(cualquiera, sin login); pon `permission:` explícito para confirmarlo"
+                )
         for fname, f in self.fields.items():
             if f.type == "enum" and len(f.choices or []) == 1:
                 out.append(
@@ -525,8 +570,17 @@ class ResourceSpec(BaseModel):
 
 def load_specs(path: Path) -> list[ResourceSpec]:
     """Carga un fichero YAML (un recurso o `resources: [...]`) o un directorio."""
+    return [spec for spec, _ in load_specs_with_sources(path)]
+
+
+def load_specs_with_sources(path: Path) -> list[tuple[ResourceSpec, Path]]:
+    """Como `load_specs`, con el fichero de cada recurso.
+
+    Un recurso definido dos veces (en dos ficheros o dos veces en el mismo) es un
+    error: antes ganaba en silencio el último por orden alfabético (UX-50)."""
     files = sorted(path.glob("*.y*ml")) if path.is_dir() else [path]
-    specs: list[ResourceSpec] = []
+    specs: list[tuple[ResourceSpec, Path]] = []
+    seen: dict[str, Path] = {}
     for file in files:
         try:
             data = yaml.safe_load(file.read_text(encoding="utf-8")) or {}
@@ -540,9 +594,21 @@ def load_specs(path: Path) -> list[ResourceSpec]:
             raise SpecError(f"{file}: se esperaba un recurso o 'resources: [...]'")
         for item in items:
             try:
-                specs.append(ResourceSpec.model_validate(item))
+                spec = ResourceSpec.model_validate(item)
             except ValidationError as exc:
                 raise SpecError(f"{file}:\n{format_errors(exc)}") from None
+            if spec.name in seen:
+                where = (
+                    f"dos veces en {file.name}"
+                    if seen[spec.name] == file
+                    else f"en {seen[spec.name].name} y en {file.name}"
+                )
+                raise SpecError(
+                    f"el recurso '{spec.name}' está definido {where}: deja una sola "
+                    "definición (borra o renombra la otra)"
+                )
+            seen[spec.name] = file
+            specs.append((spec, file))
     return specs
 
 
@@ -602,6 +668,11 @@ def validate_references(specs: list[ResourceSpec]) -> None:
 
 
 def spec_to_yaml(spec: ResourceSpec) -> str:
+    return yaml.safe_dump(spec_to_data(spec), sort_keys=False, allow_unicode=True)
+
+
+def spec_to_data(spec: ResourceSpec) -> dict[str, Any]:
+    """Spec como dict para YAML, sin los valores por defecto que solo hacen ruido."""
     data = spec.model_dump(exclude_none=True, exclude_defaults=False)
     for f in data["fields"].values():
         for key in ("nullable", "unique", "index", "immutable", "write_only"):
@@ -622,7 +693,13 @@ def spec_to_yaml(spec: ResourceSpec) -> str:
             for key in ("scope", "background", "executor", "timeout", "max_attempts", "fields"):
                 if action.get(key) == defaults[key]:
                     action.pop(key)
-    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+            # En la entrada de una acción no aplican unique/index/immutable/write_only (UX-66).
+            for f in action.get("fields", {}).values():
+                for key in ("unique", "index", "immutable", "write_only", "on_delete"):
+                    f.pop(key, None)
+                if f.get("nullable") is False:
+                    f.pop("nullable")
+    return data
 
 
 def parse_field_option(raw: str) -> tuple[str, FieldSpec]:

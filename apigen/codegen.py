@@ -8,11 +8,12 @@ import textwrap
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from apigen.naming import pascal
-from apigen.spec import FieldSpec, ResourceSpec
+from apigen.spec import FieldSpec, ResourceSpec, SpecError
 
 # Nombres que no pueden ser miembros de un Enum (o que taparían métodos de str).
 _ENUM_FORBIDDEN = {"mro", *dir(str)}
@@ -322,10 +323,12 @@ def example_expr(spec: ResourceSpec, fname: str, f: FieldSpec, *, variant: int =
         return py(f"{value:.{f.decimal_places}f}")
     if t == "bool":
         return "True" if variant == 0 else "False"
+    # Fechas futuras (dentro de un año): una regla habitual como "no puede empezar en
+    # el pasado" no rompe los tests generados (UX-58).
     if t == "date":
-        return py(f"2026-01-{10 + variant:02d}")
+        return f"_future_date({variant})"
     if t == "datetime":
-        return py(f"2026-01-{10 + variant:02d}T10:00:00+00:00")
+        return f"_future_datetime({variant})"
     if t == "uuid":
         return "str(uuid.uuid4())"
     if t == "json":
@@ -429,14 +432,18 @@ def build_context(
     doc.append("Ordering (`order_by`, prefix `-` for descending): " + ", ".join(ordering) + ".")
     actions = []
     for a in spec.actions:
-        input_cls = f"{spec.class_name}{pascal(a.name)}Input" if a.fields else None
+        # Toda acción tiene su esquema de entrada (vacío si no declara `fields`): así un
+        # cuerpo con campos desconocidos da 422 como en el resto de la API (UX-57).
+        input_cls = f"{spec.class_name}{pascal(a.name)}Input"
         actions.append(
             {
                 "name": a.name,
                 "scope": a.scope,
                 "background": a.background,
                 "perm": a.permission,
-                "alias": f"Can{pascal(a.name)}",
+                # Prefijo propio y nombre literal: nunca coincide con CanRead/CanUpdate...
+                # ni con el alias de otra acción (SEC-31).
+                "alias": f"CanAction_{a.name}",
                 "func": f"{a.name}_{spec.name}",
                 "path": f"/{{item_id}}/{a.name}" if a.scope == "item" else f"/{a.name}",
                 "task": f"{spec.name}.{a.name}",
@@ -453,10 +460,15 @@ def build_context(
                 "input_fields": [
                     create_field(spec, n, f, schema_imports) for n, f in a.fields.items()
                 ],
-                "scoped": a.permission == "owner",
+                # Sin campos obligatorios, el cuerpo se puede omitir (UX-56).
+                "body_optional": not any(f.required for f in a.fields.values()),
+                # Filtra por dueño salvo para admin y para las acciones abiertas que la
+                # spec solo admite con shared_read (SEC-32).
+                "scoped": spec.owned and a.permission == "owner",
                 "test_payload": {n: example_expr(spec, n, f) for n, f in a.fields.items()},
             }
         )
+    _check_router_symbols(spec, actions)
 
     p = spec.permissions
     return {
@@ -499,6 +511,25 @@ def build_context(
         "rate_write": spec.rate_limits.write,
         "test": build_test_context(spec, all_specs),
     }
+
+
+def _check_router_symbols(spec: ResourceSpec, actions: list[dict[str, Any]]) -> None:
+    """Defensa en profundidad (SEC-31): ningún nombre del router generado puede
+    definirse dos veces, o el segundo pisaría al primero (p. ej. un permiso)."""
+    cls = spec.class_name
+    symbols = [
+        "CanList", "CanRead", "CanCreate", "CanUpdate", "CanDelete", "OrderBy", "router", "repo",
+        f"list_{spec.plural}", f"create_{spec.name}", f"get_{spec.name}",
+        f"update_{spec.name}", f"delete_{spec.name}", f"{cls}Create", f"{cls}Read", f"{cls}Update",
+    ]  # fmt: skip
+    for a in actions:
+        symbols += [a["alias"], a["func"], a["input_cls"]]
+    repeated = sorted({name for name in symbols if symbols.count(name) > 1})
+    if repeated:
+        raise SpecError(
+            f"{spec.name}: las acciones generarían nombres repetidos en el router "
+            f"({', '.join(repeated)}); renombra la acción"
+        )
 
 
 def build_test_context(spec: ResourceSpec, all_specs: dict[str, ResourceSpec]) -> dict[str, object]:
@@ -685,7 +716,7 @@ from typing import Any  # noqa: F401
 from app.core.exceptions import APIError  # noqa: F401
 from app.hooks import HookContext
 from app.models.{spec.name} import {cls}
-from app.schemas.{spec.name} import {cls}Create, {cls}Update
+from app.schemas.{spec.name} import {cls}Create, {cls}Read, {cls}Update  # noqa: F401
 '''
     stubs: dict[str, str] = {}
     for name, (params, returns, doc, body) in _HOOK_DOCS.items():
@@ -702,12 +733,20 @@ from app.schemas.{spec.name} import {cls}Create, {cls}Update
         where = f"/{spec.plural}{item}/{a.name}"
         obj_param = f"obj: {cls}, " if a.scope == "item" else ""
         result = '{"item_id": str(obj.id)}' if a.scope == "item" else '{"ok": True}'
+        changes = (
+            "    Si cambias `obj`, el endpoint guarda los cambios al terminar (commit).\n"
+            if a.scope == "item"
+            else "    Lo que añadas o cambies en `ctx.session` se guarda al terminar (commit).\n"
+        )
         stubs[a.name] = (
             f"async def {a.name}(ctx: HookContext, {obj_param}data: dict[str, Any]) -> "
             "dict[str, Any]:\n"
             f'    """Acción `POST {where}`: devuelve un dict serializable a JSON.\n\n'
-            "    Si tarda más de un par de segundos, márcala `background: true` en el YAML\n"
-            '    para que la ejecute el worker."""\n'
+            + changes
+            + "    No devuelvas `obj.model_dump()`: incluiría los campos write_only. Usa\n"
+            f'    `{cls}Read.model_validate(obj).model_dump(mode="json")` o elige los campos.\n'
+            '    Para rechazar: `raise APIError(409, "...", code="...")`. Si tarda más de un\n'
+            '    par de segundos, márcala `background: true` para que la ejecute el worker."""\n'
             f"    return {result}\n"
         )
     return f"app/hooks/{spec.name}.py", header, stubs
@@ -741,18 +780,24 @@ from app.tasks.registry import TaskContext, TaskError, task  # noqa: F401
         keys = ('"item_id": "<uuid>"' if a.scope == "item" else "") + "".join(
             f', "{n}": ...' for n in a.fields
         )
-        doc = (a.description or f"Proceso pesado `{a.name}`.").replace('"""', "'''")
+        # Ni `\` ni `"""` de la descripción pueden romper el docstring (SEC-38).
+        raw = a.description or f"Proceso pesado `{a.name}`."
+        doc = raw.replace("\\", "\\\\").replace('"""', "'''")
         deco = (
             f'@task("{spec.name}.{a.name}", executor="{a.executor}", timeout={a.timeout}, '
             f"max_attempts={a.max_attempts})\n"
         )
         if a.executor == "async":
             if a.scope == "item":
+                # Con borrado lógico, una fila borrada tras encolar ya no existe (§3.10).
+                gone = "obj is None"
+                if spec.soft_delete:
+                    gone += " or obj.deleted_at is not None"
                 body = (
                     '    item_id = uuid.UUID(payload["item_id"])\n'
                     "    async with ctx.session() as session:\n"
                     f"        obj = await session.get({cls}, item_id)\n"
-                    "        if obj is None:\n"
+                    f"        if {gone}:\n"
                     f'            raise TaskError("{cls} no longer exists")\n'
                     "        # Aquí va el proceso pesado (informes, llamadas externas...).\n"
                     '    return {"item_id": str(item_id)}\n'
@@ -766,16 +811,28 @@ from app.tasks.registry import TaskContext, TaskError, task  # noqa: F401
                 + ") -> dict[str, Any]:\n"
                 + f'    """{doc}\n\n'
                 + f"    payload: {{{keys.lstrip(', ')}}}.\n"
+                + "    Quién lo pidió: `ctx.owner_id` (también `ctx.job_id`, `ctx.attempt`).\n"
                 + '    Sesión de BD propia: `async with ctx.session() as session`.\n    """\n'
                 + body
             )
         else:
             result = '{"item_id": payload.get("item_id")}' if a.scope == "item" else "{}"
+            where = "un hilo" if a.executor == "thread" else "un proceso aparte"
+            on_timeout = (
+                "    Si vence el timeout se mata el proceso (y se reintenta).\n"
+                if a.executor == "process"
+                else "    Un hilo no se puede interrumpir: si vence el timeout el trabajo falla\n"
+                "    sin reintento y el hilo sigue hasta acabar (hazla idempotente).\n"
+            )
             stubs[a.name] = (
                 deco
-                + f"def {a.name}(payload: dict[str, Any]) -> dict[str, Any]:\n"
+                + f"def {a.name}(ctx: TaskContext, payload: dict[str, Any]) -> dict[str, Any]:\n"
                 + f'    """{doc}\n\n'
-                + f"    Función síncrona ({a.executor}): recibe y devuelve datos JSON.\n"
+                + f"    Función síncrona: corre en {where}. payload: {{{keys.lstrip(', ')}}}.\n"
+                + "    Quién lo pidió: `ctx.owner_id` (también `ctx.job_id`, `ctx.attempt`).\n"
+                + "    No hay sesión de BD: lee los datos en el hook o en una tarea async y\n"
+                + "    pásalos en el payload; aquí, solo el cálculo. Devuelve datos JSON.\n"
+                + on_timeout
                 + '    """\n'
                 + f"    return {result}\n"
             )

@@ -159,6 +159,12 @@ class Settings(BaseSettings):
     JOBS_MAX_PAYLOAD_BYTES: int = Field(default=65_536, ge=256)
     JOBS_MAX_RESULT_BYTES: int = Field(default=262_144, ge=256)
     JOBS_RETENTION_DAYS: int = Field(default=7, ge=0, le=3650)
+    # Latido del worker para el healthcheck. Vacío = <tmp>/apigen-worker.heartbeat. Fuera
+    # de Docker, con /tmp compartido, mejor un directorio propio (SEC-36).
+    JOBS_HEARTBEAT_FILE: str = ""
+    # Qué proceso carga la configuración. El worker no firma ni valida tokens: no
+    # necesita SECRET_KEY (docker compose no se la pasa; SEC-38).
+    PROCESS_ROLE: Literal["api", "worker"] = "api"
 
     # --- Paginación ---------------------------------------------------------
     PAGE_SIZE_DEFAULT: int = Field(default=20, ge=1)
@@ -225,7 +231,12 @@ class Settings(BaseSettings):
         if self.PASSWORD_MIN_LENGTH > self.PASSWORD_MAX_LENGTH:
             problems.append("PASSWORD_MIN_LENGTH no puede ser mayor que PASSWORD_MAX_LENGTH")
 
-        if symmetric:
+        if self.PROCESS_ROLE == "worker":
+            # El worker no emite ni valida JWT: una clave efímera basta (y si alguien lo
+            # compromete no se lleva la clave que firma los tokens).
+            if symmetric and (secret.lower() in _INSECURE_SECRETS or len(secret) < 32):
+                self.SECRET_KEY = SecretStr(secrets.token_urlsafe(64))
+        elif symmetric:
             weak = secret.lower() in _INSECURE_SECRETS or len(secret) < 32
             if weak and self.is_production:
                 problems.append("SECRET_KEY debe tener al menos 32 caracteres aleatorios")
@@ -248,10 +259,6 @@ class Settings(BaseSettings):
         if self.is_production:
             if self.DEBUG:
                 problems.append("DEBUG debe ser false en producción")
-            if "*" in self.CORS_ORIGINS:
-                problems.append("CORS_ORIGINS no puede ser '*' en producción")
-            if "*" in self.ALLOWED_HOSTS:
-                problems.append("ALLOWED_HOSTS debe enumerar los dominios reales en producción")
             if self.DATABASE_URL.startswith("sqlite"):
                 if self.ALLOW_SQLITE_IN_PRODUCTION:
                     logger.warning("Usando SQLite en producción: recomendado PostgreSQL.")
@@ -261,25 +268,36 @@ class Settings(BaseSettings):
                         "DATABASE_URL apunta a SQLite: usa PostgreSQL en producción "
                         "(o ALLOW_SQLITE_IN_PRODUCTION=true si es intencionado)"
                     )
-            if self.RATE_LIMIT_ENABLED and self.RATE_LIMIT_STORAGE_URI.startswith("memory"):
-                logger.warning(
-                    "Rate limit en memoria: con varios workers/instancias cada uno "
-                    "cuenta por separado. Usa Redis (RATE_LIMIT_STORAGE_URI)."
-                )
-            problems += _proxy_problems(self.TRUSTED_PROXIES)
-            if not self.TRUSTED_PROXIES:
-                logger.warning(
-                    "TRUSTED_PROXIES vacío: si la API está detrás de un proxy inverso, "
-                    "todos los clientes compartirán la IP del proxy (rate limit y bloqueo "
-                    "de login globales) y no se enviará HSTS. Ver README, sección Despliegue."
-                )
-            weak_old = [k for k in self.JWT_PREVIOUS_SECRET_KEYS if len(k) < 32]
-            if symmetric and weak_old:
-                problems.append("JWT_PREVIOUS_SECRET_KEYS: cada clave necesita 32+ caracteres")
+            if self.PROCESS_ROLE == "api":
+                problems += self._api_production_problems(symmetric)
 
         if problems:
             raise ValueError("Configuración insegura:\n  - " + "\n  - ".join(problems))
         return self
+
+    def _api_production_problems(self, symmetric: bool) -> list[str]:
+        """Comprobaciones de producción que solo afectan a la API HTTP (no al worker)."""
+        problems: list[str] = []
+        if "*" in self.CORS_ORIGINS:
+            problems.append("CORS_ORIGINS no puede ser '*' en producción")
+        if "*" in self.ALLOWED_HOSTS:
+            problems.append("ALLOWED_HOSTS debe enumerar los dominios reales en producción")
+        if self.RATE_LIMIT_ENABLED and self.RATE_LIMIT_STORAGE_URI.startswith("memory"):
+            logger.warning(
+                "Rate limit en memoria: con varios workers/instancias cada uno "
+                "cuenta por separado. Usa Redis (RATE_LIMIT_STORAGE_URI)."
+            )
+        problems += _proxy_problems(self.TRUSTED_PROXIES)
+        if not self.TRUSTED_PROXIES:
+            logger.warning(
+                "TRUSTED_PROXIES vacío: si la API está detrás de un proxy inverso, "
+                "todos los clientes compartirán la IP del proxy (rate limit y bloqueo "
+                "de login globales) y no se enviará HSTS. Ver README, sección Despliegue."
+            )
+        weak_old = [k for k in self.JWT_PREVIOUS_SECRET_KEYS if len(k) < 32]
+        if symmetric and weak_old:
+            problems.append("JWT_PREVIOUS_SECRET_KEYS: cada clave necesita 32+ caracteres")
+        return problems
 
     # --- Propiedades derivadas ----------------------------------------------
     @property

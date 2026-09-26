@@ -458,7 +458,8 @@ def test_actions_generate_endpoints_hooks_and_tasks(tmp_path):
     assert "preview" in hooks and "export_pdf" not in hooks  # las de fondo van al worker
     _, tasks_header, tasks = tasks_module(spec)
     assert set(tasks) == {"export_pdf", "crunch"}
-    assert 'executor="process"' in tasks["crunch"] and "def crunch(payload" in tasks["crunch"]
+    assert 'executor="process"' in tasks["crunch"]
+    assert "def crunch(ctx: TaskContext, payload" in tasks["crunch"]  # UX-53: recibe ctx
     for header, stubs in ((hooks_header, hooks), (tasks_header, tasks)):
         compile(header + "\n\n" + "\n\n".join(stubs.values()), "<stub>", "exec")
 
@@ -482,3 +483,263 @@ def test_user_modules_are_never_overwritten(tmp_path):
     path.write_text("def broken(:\n")
     assert ensure_user_module(path, header, stubs)[0] == "unparseable"
     assert path.read_text() == "def broken(:\n"
+
+
+def _docs_project(tmp_path) -> Path:
+    import shutil
+
+    (tmp_path / "app/api").mkdir(parents=True)
+    shutil.copy(ROOT / "app/api/versions.py", tmp_path / "app/api/versions.py")
+    shutil.copy(ROOT / ".env.example", tmp_path / ".env.example")
+    (tmp_path / "resources").mkdir()
+    shutil.copy(ROOT / "examples/cursos.yaml", tmp_path / "resources/cursos.yaml")
+    return tmp_path
+
+
+def test_client_readme_is_generated_and_keeps_manual_text(tmp_path):
+    """`apigen docs`: README.md para el cliente desde los recursos; conserva lo manual."""
+    from apigen.docs import END, write_readme
+
+    base = _docs_project(tmp_path)
+    path, created, lang = write_readme(base, "en")
+    text = path.read_text()
+    assert created and lang == "en" and "<!-- apigen:docs:start lang=en" in text and END in text
+    assert "`/api/v1/enrollments/{id}/certificate`" in text and "background (202)" in text
+    assert "never returned" in text  # write_only
+    assert "### Background jobs" in text
+
+    custom = text.replace("Describe here what this API does", "Our custom intro")
+    path.write_text(custom + "\nManual notes at the end.\n")
+    _, created_again, _ = write_readme(base, "es")
+    updated = path.read_text()
+    assert not created_again
+    assert "Our custom intro" in updated and "Manual notes at the end." in updated
+    assert "### Autenticación" in updated  # sección regenerada en español
+    assert updated.count("apigen:docs:start") == 1
+
+
+def test_client_readme_remembers_language_and_base_url(tmp_path):
+    """UX-52: `apigen docs` sin --lang conserva el idioma (y la URL base) elegidos."""
+    from apigen.docs import write_readme
+
+    base = _docs_project(tmp_path)
+    write_readme(base, "es", base_url="https://api.cliente.com")
+    path, _, lang = write_readme(base)
+    text = path.read_text()
+    assert lang == "es" and "## Guía de integración" in text
+    assert "curl -X POST https://api.cliente.com/api/v1/auth/login" in text
+    # README antiguo (marcador sin atributos, en español): se deduce el idioma.
+    path.write_text("# X\n<!-- apigen:docs:start -->\n## Autenticación\n<!-- apigen:docs:end -->\n")
+    assert write_readme(base)[2] == "es"
+
+
+def test_client_readme_documents_integration_details(tmp_path):
+    """Informe del usuario (ronda 7): respuesta del login, paginación, un ejemplo por
+    recurso, qué devuelven las acciones, trabajos (cancelled, 409), arranque Docker
+    completo y errores propios de los hooks (se extraen del código)."""
+    from apigen.docs import write_readme
+
+    base = _docs_project(tmp_path)
+    (base / "app/hooks").mkdir(parents=True)
+    (base / "app/hooks/course.py").write_text(
+        "from app.core.exceptions import APIError\n"
+        "async def before_create(ctx, data):\n"
+        "    raise APIError(409, 'The course is full', code='course_full')\n"
+    )
+    text = write_readme(base, "en")[0].read_text()
+    for expected in (
+        '"token_type": "bearer"',  # respuesta del login
+        '{"items": [...], "total": 42',  # forma de la paginación
+        "curl -X POST http://127.0.0.1:8000/api/v1/courses",  # ejemplo por recurso
+        "`200` → a JSON object",  # acción síncrona
+        '"status_url"',  # acción en segundo plano
+        "`cancelled`",
+        "job_not_cancellable",
+        "POSTGRES_PASSWORD",
+        "openssl rand",
+        "ALLOWED_HOSTS=",
+        "| 409 | `course_full` | The course is full |",  # error propio, conservado
+    ):
+        assert expected in text, expected
+
+
+def _files(spec: ResourceSpec, tmp_path) -> dict[str, str]:
+    """Router y esquemas generados, por tipo."""
+    out = {}
+    for r in render_resource(tmp_path, spec, {spec.name: spec}):
+        kind = r.path.parent.name
+        out[{"endpoints": "router", "schemas": "schemas", "models": "model"}.get(kind, kind)] = (
+            r.content
+        )
+    return out
+
+
+@pytest.mark.parametrize("name", ["list", "read", "create", "update", "delete", "get"])
+def test_actions_named_like_crud_operations_rejected(name):
+    """SEC-31: una acción `read` redefinía `CanRead` y abría GET /{id} a su permiso."""
+    with pytest.raises(ValidationError):
+        _spec(actions=[{"name": name}])
+
+
+def test_action_permission_aliases_cannot_override_crud(tmp_path):
+    """SEC-31: los alias de las acciones tienen prefijo propio y se definen una vez."""
+    spec = _spec(
+        permissions={"read": "admin", "list": "admin"},
+        actions=[{"name": "mark_read", "permission": "user"}, {"name": "archive"}],
+    )
+    router = _files(spec, tmp_path)["router"]
+    assert router.count("CanRead = ") == 1
+    assert "CanRead = Annotated[Principal, Depends(require(Access.admin, Scope.read))]" in router
+    assert "CanAction_mark_read = Annotated[Principal, Depends(require(Access.user" in router
+    # Nombres que PascalCase confundiría (a_1 / a1 -> A1) se detectan antes de generar.
+    clash = _spec(actions=[{"name": "a_1"}, {"name": "a1"}])
+    with pytest.raises(SpecError, match="nombres repetidos"):
+        render_resource(tmp_path, clash, {"widget": clash})
+
+
+def test_owned_item_actions_open_to_any_user_are_rejected(tmp_path):
+    """SEC-32: en un recurso owned, una acción de item con permission=user cargaba filas
+    ajenas (BOLA). Solo se admite con shared_read y lectura abierta."""
+    for level in ("user", "public"):
+        with pytest.raises(ValidationError, match="BOLA"):
+            _spec(owned=True, actions=[{"name": "export", "permission": level}])
+    shared = _spec(
+        owned=True,
+        shared_read=True,
+        permissions={"read": "user"},
+        actions=[
+            {"name": "export", "permission": "user"},
+            {"name": "audit", "permission": "admin"},
+        ],
+    )
+    assert any("shared_read" in w for w in shared.warnings())
+
+    def body(router: str, func: str) -> str:
+        return router.split(f"async def {func}(")[1].split("\n@router")[0]
+
+    router = _files(shared, tmp_path)["router"]
+    assert "scoped=False" in body(router, "export_widget")  # shared_read: a propósito
+    assert "scoped=False" in body(router, "audit_widget")  # admin: cualquiera
+    owned = _files(_action_spec(), tmp_path)["router"]
+    assert "scoped=True" in body(owned, "preview_report")  # owner: solo lo suyo
+
+
+def test_action_input_fields_and_descriptions_are_validated():
+    """SEC-38: nombres de pydantic en la entrada de una acción y `\\` en la descripción."""
+    from apigen.codegen import tasks_module
+
+    for fname in ("model_config", "model_dump", "json", "copy"):
+        with pytest.raises(ValidationError):
+            _spec(actions=[{"name": "x", "fields": {fname: {"type": "str"}}}])
+    spec = _action_spec(
+        actions=[{"name": "export", "background": True, "description": r"Ruta C:\Nuevo \x4 \N"}]
+    )
+    _, header, stubs = tasks_module(spec)
+    compile(header + "\n\n" + "\n\n".join(stubs.values()), "<stub>", "exec")
+
+
+def test_sync_actions_commit_reject_unknown_body_and_allow_empty_body(tmp_path):
+    """UX-54/56/57: la acción síncrona guarda sus cambios; un cuerpo con campos
+    desconocidos da 422 y, sin campos obligatorios, el cuerpo es opcional."""
+    spec = _action_spec(
+        actions=[
+            {"name": "check_in"},
+            {"name": "remind", "fields": {"channel": {"type": "str", "nullable": True}}},
+            {"name": "rename", "fields": {"title": {"type": "str"}}},
+        ]
+    )
+    files = _files(spec, tmp_path)
+    router, schemas = files["router"], files["schemas"]
+    assert "await session.commit()" in router
+    assert "payload: Annotated[ReportCheckInInput, Body(default_factory=ReportCheckInInput)]" in (
+        router
+    )
+    assert "payload: ReportRenameInput," in router
+    assert "class ReportCheckInInput(StrictInput):" in schemas
+
+
+def test_background_actions_without_rate_limit_warn():
+    spec = _action_spec()
+    assert any("sin rate_limit" in w for w in spec.warnings())
+
+
+def test_each_resource_has_a_single_spec_file(tmp_path):
+    """UX-50: un YAML con varios recursos en resources/ es la fuente de esos recursos:
+    no se escriben copias por recurso, los duplicados son un error y una definición
+    distinta (p. ej. desde `apigen add`) se rechaza en vez de pisar a la otra."""
+    import yaml
+
+    from apigen.project import check_spec_sources, save_spec
+
+    resources = tmp_path / "resources"
+    resources.mkdir()
+    gym = {
+        "resources": [
+            {"name": "gym_class", "fields": {"title": {"type": "str"}}},
+            {"name": "booking", "owned": True, "fields": {"notes": {"type": "text"}}},
+        ]
+    }
+    (resources / "gym.yaml").write_text("# mis comentarios\n" + yaml.safe_dump(gym))
+    specs = load_specs(resources)
+    sources = check_spec_sources(tmp_path, specs)  # generar desde gym.yaml: válido
+    for spec in specs:
+        assert "gym.yaml (fuente de" in save_spec(tmp_path, spec, sources)
+    assert sorted(p.name for p in resources.iterdir()) == ["gym.yaml"]
+
+    changed = _spec(name="booking", owned=True, fields={"notes": {"type": "str"}})
+    with pytest.raises(SpecError, match="ya está definido en resources/gym.yaml"):
+        check_spec_sources(tmp_path, [changed])
+
+    (resources / "booking.yaml").write_text(yaml.safe_dump(gym["resources"][1]))
+    with pytest.raises(SpecError, match="booking.* en booking.yaml y en gym.yaml"):
+        load_specs(resources)
+
+
+def test_saving_an_unchanged_spec_keeps_comments(tmp_path):
+    """UX-66: si el YAML ya tiene esa definición no se reescribe (conserva tu formato)."""
+    from apigen.project import save_spec
+
+    resources = tmp_path / "resources"
+    resources.mkdir()
+    text = "# Mi recurso\nname: widget\nfields: {title: {type: str}}  # corto\n"
+    (resources / "widget.yaml").write_text(text)
+    assert save_spec(tmp_path, _spec()).endswith("(sin cambios)")
+    assert (resources / "widget.yaml").read_text() == text
+    assert "unique: false" not in _spec_yaml_for_action()
+
+
+def _spec_yaml_for_action() -> str:
+    from apigen.spec import spec_to_yaml
+
+    return spec_to_yaml(_spec(actions=[{"name": "go", "fields": {"channel": {"type": "str"}}}]))
+
+
+def test_only_accepts_commas_and_lists_available_resources(tmp_path, monkeypatch):
+    """UX-59: `--only a,b` funciona y, si no coincide, dice qué recursos hay."""
+    from typer.testing import CliRunner
+
+    from apigen import cli
+
+    captured = {}
+    monkeypatch.setattr(cli, "_generate", lambda specs, **kw: captured.setdefault("s", specs))
+    runner = CliRunner()
+    shop = str(ROOT / "examples/shop.yaml")
+    result = runner.invoke(cli.app, ["generate", shop, "--only", "category,product"])
+    assert result.exit_code == 0, result.output
+    assert [s.name for s in captured["s"]] == ["category", "product"]
+    missing = runner.invoke(cli.app, ["generate", shop, "--only", "nope"])
+    assert missing.exit_code == 1 and "Recursos disponibles: category" in missing.output
+
+
+async def test_ordering_parameter_gets_a_hint():
+    """UX-60: `?ordering=` (la clave del YAML) da 422 con la pista de `order_by`."""
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    from app.api.deps import query_guard
+
+    guard = query_guard(frozenset({"limit", "offset", "order_by"}), frozenset({"title"}))
+    request = Request({"type": "http", "query_string": b"ordering=-title", "headers": []})
+    with pytest.raises(HTTPException) as exc:
+        await guard(request)
+    assert "use order_by" in exc.value.detail[0]["msg"]

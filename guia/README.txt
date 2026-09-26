@@ -546,8 +546,22 @@ escribir `uv run` delante de todo, activa el entorno: `source .venv/bin/activate
   before_update(obj, data) · after_update(obj) · before_delete(obj) ·
   after_delete(obj). ctx.session (BD), ctx.principal / ctx.user_id (quién).
 
-  Cambiar campos, permisos o filtros -> edita resources/<recurso>.yaml y
-    apigen generate --force --only <recurso>   (tus hooks se conservan)
+  Errores de negocio: usa siempre APIError(status, "mensaje", code="codigo").
+  `apigen docs` los lista solos en el README del cliente (se leen del código).
+
+  Acción síncrona (sin background): función homónima en el mismo fichero.
+  Si cambias `obj` el endpoint hace el commit por ti. Devuelve un dict; nunca
+  obj.model_dump() (saldrían los campos write_only). Un cuerpo con campos
+  desconocidos da 422; sin campos obligatorios, el cuerpo es opcional.
+
+  Si tus hooks rechazan los datos de los tests generados (p. ej. "no puede ser
+  en el pasado"), fija `example:` en el campo del YAML. Las fechas de los
+  tests ya son futuras (dentro de un año).
+
+  Cambiar campos, permisos o filtros -> edita el YAML donde esté definido el
+  recurso (resources/<recurso>.yaml o tu YAML con varios recursos: apigen no
+  crea copias, y un recurso definido dos veces es un error) y
+    apigen generate resources --force --only <recurso>[,<otro>]   (hooks intactos)
     apigen db migrate -m "..."
   Añadir un endpoint nuevo -> una acción en el YAML (ver §15) o, si es muy
     particular, un router propio en app/api/v1/endpoints/ registrado en
@@ -577,6 +591,34 @@ escribir `uv run` delante de todo, activa el entorno: `source .venv/bin/activate
   - raise TaskError("mensaje") -> fallo visible para el cliente, sin reintento.
   - Cualquier otra excepción -> se reintenta (10 s, 20 s, 40 s...) y el
     cliente solo ve "Task failed" (la traza queda en el log con el job_id).
+  - Quién lo pidió: ctx.owner_id (también ctx.job_id, ctx.attempt). Las
+    tareas thread/process también reciben ctx, pero sin sesión de BD: lee los
+    datos en el hook o en una tarea async y pásalos en el payload.
+  - Timeout: una tarea process se mata al vencer (y se reintenta); un hilo no
+    se puede matar, así que falla sin reintento: hazla idempotente.
+  - Pon rate_limit a las acciones en segundo plano (apigen avisa si falta).
   - Más capacidad: más workers (docker compose up --scale worker=3) o
     JOBS_CONCURRENCY. CPU pesada: executor: process + JOBS_PROCESS_WORKERS.
   - En tests: from app.tasks.worker import process_pending; await process_pending()
+
+
+--------------------------------------------------------------------------------
+16. EMPEZAR LA API DE UN CLIENTE Y ENTREGARLA
+--------------------------------------------------------------------------------
+
+  1. make new-api NAME=<cliente>-api LANG=es      -> ~/Developer/<cliente>-api
+  2. En tu Second Brain: nuevo proyecto con la plantilla "Proyecto API para cliente".
+  3. Recursos en resources/*.yaml -> uv run apigen generate resources --migrate
+  4. Hooks, tareas, tests (uv run pytest) y revisión con los agentes.
+  5. Al terminar: uv run apigen docs --lang es --base-url https://api.cliente.com
+     -> README.md para el cliente (después basta `uv run apigen docs`: recuerda
+     idioma y URL). Completa la introducción y el contacto (se conservan).
+  6. Prueba el arranque del README tal cual: cp .env.example .env, rellena
+     SECRET_KEY, POSTGRES_PASSWORD y ALLOWED_HOSTS, docker compose up -d --build.
+  7. Entrega: `make deliver` -> ../<proyecto>-entrega.zip con lo versionado,
+     sin .claude/, graphify-out/, security/, loadtests/ ni CLAUDE.md (o da
+     acceso al repo si el cliente también va a desarrollar: docs/DESARROLLO.txt).
+
+  new_api.py exige la plantilla sin cambios sin commit y copia solo lo
+  versionado; antes del commit inicial revisa secretos y datos personales en
+  todos los ficheros (si encuentra algo, no hace commit y te lo lista).

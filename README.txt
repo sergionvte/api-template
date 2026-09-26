@@ -309,8 +309,12 @@ partir de una línea de comandos o de un fichero YAML.
 --------------------------------------------------------------------------------
 
   apigen init-env --production   # SECRET_KEY y POSTGRES_PASSWORD aleatorias
-  # edita .env: ALLOWED_HOSTS (obligatorio), CORS_ORIGINS...
-  docker compose up --build      API + PostgreSQL + Redis (siempre production)
+  # (sin apigen: cp .env.example .env y openssl rand -base64 48 / -hex 24)
+  # edita .env: ALLOWED_HOSTS (obligatorio; añade localhost,127.0.0.1 para
+  # probar en local), CORS_ORIGINS...
+  docker compose up -d --build   API + worker + PostgreSQL + Redis (production)
+  El healthcheck de la imagen envía como Host el primer dominio de
+  ALLOWED_HOSTS. Sin orquestador, un contenedor unhealthy no se reinicia.
   o bien:
   ENVIRONMENT=production uv run apigen serve --workers 4
 
@@ -474,6 +478,19 @@ partir de una línea de comandos o de un fichero YAML.
       - name: reindex              POST /products/reindex
         scope: collection
 
+    Reglas de las acciones (se validan al generar):
+    - Nombres reservados: list, read, create, update, delete, get (y los de
+      hooks/tareas). Sus permisos usan alias propios (CanAction_<nombre>), que
+      nunca pisan los del CRUD.
+    - En un recurso owned, una acción de item con permission user/public es un
+      error (BOLA) salvo con shared_read: true y read igual de abierto; por
+      defecto hereda owner (el dueño; admins: cualquiera).
+    - Toda acción valida su cuerpo (campos desconocidos -> 422). Sin campos
+      obligatorios el cuerpo se puede omitir.
+    - Acción síncrona: si cambia `obj` o la sesión, el endpoint hace el commit.
+      No devuelvas obj.model_dump() (incluiría campos write_only).
+    - Aviso si una acción en segundo plano no tiene rate_limit (salvo admin).
+
   Worker (proceso aparte: lo pesado nunca frena la API)
     apigen worker                  (o make worker; docker compose: servicio worker)
     - La cola vive en la base de datos (tabla jobs): sin Redis ni broker.
@@ -486,4 +503,67 @@ partir de una línea de comandos o de un fichero YAML.
     - Tareas propias: app/tasks/resources/<recurso>.py (tu código) o cualquier
       módulo con @task("nombre") importado en app/tasks/__init__.py.
     - Desde un hook: await ctx.enqueue("order.export_invoice", {...}).
+    - Contexto: toda tarea puede recibir ctx (ctx.owner_id = quién la pidió,
+      ctx.job_id, ctx.attempt); las thread/process lo reciben si declaran
+      (ctx, payload). ctx.session() solo en las async: en thread/process pasa
+      los datos en el payload.
+    - Timeouts: async se cancela; process corre en un proceso por trabajo
+      (como mucho JOBS_PROCESS_WORKERS a la vez) que se MATA al vencer y se
+      reintenta; un hilo no se puede matar: falla sin reintento (hazla
+      idempotente). El timeout cuenta desde que la tarea empieza.
+    - Solo el worker que tiene el arrendamiento guarda el resultado.
+    - El worker no recibe SECRET_KEY en docker compose (PROCESS_ROLE=worker).
+      Su latido (JOBS_HEARTBEAT_FILE) solo se escribe si la BD responde.
     - Configuración: variables JOBS_* en .env.example. Limpieza: apigen db prune.
+
+  Un recurso = un fichero en resources/
+    Puedes usar un YAML por recurso o uno con varios (resources: [...]). apigen
+    no escribe resources/<recurso>.yaml si el recurso ya está en otro fichero de
+    resources/ (ese es su fuente); un recurso definido dos veces es un error, y
+    `apigen add` con una definición distinta a la de ese fichero se rechaza.
+    `apigen generate resources --force --only a,b` (comas o --only repetido).
+
+
+--------------------------------------------------------------------------------
+13. NUEVA API PARA UN CLIENTE Y DOCUMENTACIÓN DE ENTREGA
+--------------------------------------------------------------------------------
+
+  make new-api NAME=cursos-api [LANG=es]
+  (= python3 scripts/new_api.py cursos-api --lang es --dir ~/Developer)
+
+  Crea ~/Developer/cursos-api con solo lo necesario para desarrollar y
+  entregar: sin informes internos de la plantilla, guía personal, grafo ni
+  configuración local (.claude/settings.json). Renombra el proyecto, instala
+  dependencias, crea .env (no versionado), pasa los tests, construye el grafo
+  (graphify) e inicializa git con un commit inicial.
+
+  Seguridad del script:
+  - Exige la plantilla sin cambios sin commit (--allow-dirty para seguir: los
+    ficheros nuevos no se copian nunca). Copia SOLO lo versionado.
+  - Se niega si la plantilla tiene versionado código de recursos generados.
+  - Justo antes del commit revisa TODOS los ficheros de texto a versionar
+    (README y grafo incluidos): rutas de usuario, emails que no sean de
+    ejemplo (example.com, .test...), claves privadas, sk_live_, AWS, tokens de
+    GitHub/Slack/Google, secretos con valor y contraseñas en URLs. Si hay algo,
+    no hace commit.
+  - El proyecto trae docs/DESARROLLO.txt (referencia de apigen: YAML, hooks,
+    acciones, worker, versiones, graphify) y `make deliver` (zip de lo
+    versionado sin .claude/, graphify-out/, security/ ni loadtests/).
+
+  Documentación para el cliente (README.md):
+    uv run apigen docs [--lang en|es] [--base-url https://api.cliente.com]
+  Se genera desde resources/*.yaml, las versiones y .env.example. Primero la
+  guía de integración (primeros pasos con la respuesta del login, paginación,
+  errores, cuentas y roles, un ejemplo curl por recurso, qué devuelve cada
+  acción, trabajos con todos sus estados y el 409 de cancelación), después el
+  despliegue (Docker paso a paso con SECRET_KEY, POSTGRES_PASSWORD y
+  ALLOWED_HOSTS) y el desarrollo local. Los errores propios de los hooks
+  (APIError(..., code="...")) y los mensajes de TaskError se extraen del
+  código, así que se conservan al regenerar. El idioma y la URL base quedan
+  en el marcador <!-- apigen:docs:start lang=.. base_url=.. --> y se reutilizan
+  si no pasas las opciones. Solo se regenera lo que está entre los
+  marcadores; tu introducción y el contacto se conservan.
+
+  Validado con Docker (API + 3 workers + PostgreSQL 17 + Redis 7): 24/24
+  comprobaciones de extremo a extremo, 15 trabajos repartidos sin duplicados,
+  Redis caído sin errores (fallback a memoria) y healthchecks correctos.

@@ -1,4 +1,4 @@
-.PHONY: install env dev test lint format migrate check audit loadtest graph graph-query worker
+.PHONY: install env dev test lint format migrate check audit loadtest graph graph-query worker new-api docs deliver
 
 install:        ## Instala dependencias (incluye dev)
 	uv sync
@@ -31,7 +31,7 @@ audit:          ## Auditoría de dependencias (vulnerabilidades conocidas)
 	uv export --frozen --no-hashes --no-emit-project --format requirements-txt \
 		| uvx pip-audit --no-deps --disable-pip -r /dev/stdin
 
-loadtest:       ## Prueba de estrés (ver loadtests/README)
+loadtest:       ## Prueba de estrés (ver README §8)
 	./loadtests/run_loadtest.sh
 
 GRAPHIFY_CHECK = @command -v graphify >/dev/null 2>&1 || { \
@@ -46,3 +46,15 @@ graph-query:    ## Consulta el grafo: make graph-query Q="cómo funciona el refr
 	$(GRAPHIFY_CHECK)
 	@test -n "$(Q)" || { echo 'Uso: make graph-query Q="tu pregunta"'; exit 1; }
 	graphify query "$(Q)" --budget 1500
+
+new-api:        ## Nueva API en ~/Developer: make new-api NAME=cursos-api [LANG=es]
+	python3 scripts/new_api.py $(NAME) $(if $(LANG),--lang $(LANG),)
+
+docs:           ## README.md para el cliente a partir de los recursos (LANG=en|es)
+	uv run apigen docs $(if $(LANG),--lang $(LANG),)
+
+deliver:        ## Zip para entregar al cliente (lo versionado, sin herramientas internas)
+	git archive --format=zip -o ../$(notdir $(CURDIR))-entrega.zip HEAD -- . \
+		':(exclude).claude' ':(exclude)graphify-out' ':(exclude)security' ':(exclude)loadtests' \
+		':(exclude)CLAUDE.md'
+	@echo "Entrega: ../$(notdir $(CURDIR))-entrega.zip (sin .claude/, graphify-out/, security/, loadtests/)"

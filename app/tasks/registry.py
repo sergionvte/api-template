@@ -16,8 +16,14 @@ Tipos de ejecución (`executor`):
   (PDFs, imágenes, cálculos): no bloquea al resto de tareas por el GIL. Debe
   estar definida a nivel de módulo y recibir/devolver datos serializables.
 
-Las tareas síncronas reciben solo ``payload``; las async reciben ``ctx`` y
-``payload``. Todas devuelven un dict/list serializable a JSON (o None).
+Las async reciben ``ctx`` y ``payload``. Las síncronas reciben ``payload`` o, si
+declaran dos parámetros, ``ctx`` y ``payload`` (``ctx.owner_id``, ``ctx.job_id``,
+``ctx.attempt``; ``ctx.session()`` solo sirve en las async). Todas devuelven un
+dict/list serializable a JSON (o None).
+
+Timeouts: una tarea async se cancela; una ``process`` se mata (su proceso) y se
+puede reintentar; un hilo (``thread``) no se puede interrumpir, así que al vencer
+el trabajo falla sin reintento y el hilo sigue hasta acabar: hazla idempotente.
 """
 
 from __future__ import annotations
@@ -57,11 +63,12 @@ class TaskDef:
     timeout: float
     payload_model: type[BaseModel] | None = None
     description: str = ""
+    takes_ctx: bool = True  # las síncronas pueden declarar solo `payload`
 
 
 @dataclass(slots=True)
 class TaskContext:
-    """Contexto que reciben las tareas async."""
+    """Contexto de la tarea (serializable: también llega a las `thread`/`process`)."""
 
     job_id: uuid.UUID
     owner_id: uuid.UUID | None
@@ -99,6 +106,7 @@ def task(
             raise TypeError(f"{name}: executor='async' requiere una función async")
         if executor != "async" and is_async:
             raise TypeError(f"{name}: executor='{executor}' requiere una función síncrona")
+        takes_ctx = is_async or len(inspect.signature(func).parameters) >= 2
         existing = REGISTRY.get(name)
         if existing and existing.func is not func:
             raise ValueError(f"la tarea {name!r} ya está registrada en {existing.func.__module__}")
@@ -110,6 +118,7 @@ def task(
             timeout=float(timeout),
             payload_model=payload_model,
             description=description or (func.__doc__ or "").strip().split("\n")[0],
+            takes_ctx=takes_ctx,
         )
         return func
 

@@ -11,7 +11,7 @@ import uuid
 from typing import Annotated, {{ "Any, " if has_sync else "" }}Literal
 {{ router_imports }}
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import {{ "Body, " if actions else "" }}APIRouter, Depends, HTTPException, Query, Request, Response, status
 
 import app.hooks.{{ name }} as hooks
 from app.api.deps import (
@@ -39,7 +39,7 @@ from app.models.{{ ref.module }} import {{ ref.model }}
 from app.models.{{ name }} import {{ cls }}{% for e in enums.values() %}, {{ e.cls }}{% endfor %}
 
 from app.schemas.common import Page
-from app.schemas.{{ name }} import {{ cls }}Create, {{ cls }}Read, {{ cls }}Update{% for a in actions if a.input_cls %}, {{ a.input_cls }}{% endfor %}
+from app.schemas.{{ name }} import {{ cls }}Create, {{ cls }}Read, {{ cls }}Update{% for a in actions %}, {{ a.input_cls }}{% endfor %}
 
 {% if has_background %}
 from app.tasks.queue import JobAccepted, enqueue
@@ -62,6 +62,9 @@ CanRead = Annotated[Principal, Depends(require(Access.{{ perm.read }}, Scope.rea
 CanCreate = Annotated[Principal, Depends(require(Access.{{ perm.create }}, Scope.write))]
 CanUpdate = Annotated[Principal, Depends(require(Access.{{ perm.update }}, Scope.write))]
 CanDelete = Annotated[Principal, Depends(require(Access.{{ perm.delete }}, Scope.write))]
+{% if actions %}
+# Permisos de las acciones (prefijo propio: no pueden pisar los del CRUD).
+{% endif %}
 {% for a in actions %}
 {{ a.alias }} = Annotated[Principal, Depends(require(Access.{{ a.perm }}, Scope.write))]
 {% endfor %}
@@ -287,7 +290,10 @@ async def {{ a.func }}(
 {% endif %}
     principal: {{ a.alias }},
     session: SessionDep,
-{% if a.input_cls %}
+{% if a.body_optional %}
+    # Sin campos obligatorios: el cuerpo se puede omitir (equivale a `{}`).
+    payload: Annotated[{{ a.input_cls }}, Body(default_factory={{ a.input_cls }})],
+{% else %}
     payload: {{ a.input_cls }},
 {% endif %}
 ) -> {{ "JobAccepted" if a.background else "dict[str, Any]" }}:
@@ -303,9 +309,7 @@ async def {{ a.func }}(
 {% if a.scope == "item" %}
             "item_id": str(obj.id),
 {% endif %}
-{% if a.input_cls %}
             **payload.model_dump(mode="json"),
-{% endif %}
         },
         owner_id=principal.user_id,
     )
@@ -314,12 +318,15 @@ async def {{ a.func }}(
     return JobAccepted(job_id=job.id, status=job.status, status_url=status_url)
 {% else %}
     ctx = HookContext(session=session, principal=principal)
-    return await hooks.{{ a.name }}(
+    result = await hooks.{{ a.name }}(
         ctx,
 {% if a.scope == "item" %}
         obj,
 {% endif %}
-        {{ "payload.model_dump(mode=\"json\")" if a.input_cls else "{}" }},
+        payload.model_dump(mode="json"),
     )
+    if session.new or session.dirty or session.deleted:
+        await session.commit()  # guarda lo que la acción haya cambiado
+    return result
 {% endif %}
 {% endfor %}

@@ -149,7 +149,10 @@ def add(
 @app.command()
 def generate(
     path: Annotated[Path, typer.Argument(help="Fichero YAML o directorio")] = Path("resources"),
-    only: Annotated[list[str] | None, typer.Option(help="Generar solo estos recursos")] = None,
+    only: Annotated[
+        list[str] | None,
+        typer.Option(help="Generar solo estos recursos (repetible o separados por comas)"),
+    ] = None,
     force: Annotated[bool, typer.Option(help="Sobrescribir ficheros existentes")] = False,
     dry_run: Annotated[bool, typer.Option(help="Mostrar qué se generaría sin escribir")] = False,
     tests: Annotated[bool, typer.Option("--tests/--no-tests", help="Generar tests")] = True,
@@ -163,9 +166,16 @@ def generate(
     except SpecError as exc:
         _fail(str(exc))
     if only:
-        specs = [s for s in specs if s.name in only]
-        if not specs:
-            _fail("Ningún recurso coincide con --only")
+        # `--only a,b` o `--only a --only b` (UX-59).
+        wanted = {name.strip() for item in only for name in item.split(",") if name.strip()}
+        available = [s.name for s in specs]
+        specs = [s for s in specs if s.name in wanted]
+        unknown = sorted(wanted - set(available))
+        if not specs or unknown:
+            _fail(
+                f"--only: no existe {', '.join(unknown) or ', '.join(sorted(wanted))} en {path}. "
+                f"Recursos disponibles: {', '.join(available) or '(ninguno)'}"
+            )
     _generate(specs, force=force, dry_run=dry_run, with_tests=tests, migrate=migrate)
 
 
@@ -263,6 +273,38 @@ def list_resources() -> None:
         )
         for warning in spec.warnings():
             typer.secho(f"    ! {warning}", fg=typer.colors.YELLOW)
+
+
+@app.command()
+def docs(
+    lang: Annotated[
+        str | None,
+        typer.Option(help="Idioma del README: en | es (por defecto, el que ya tiene; si no, en)"),
+    ] = None,
+    base_url: Annotated[
+        str | None,
+        typer.Option(help="URL pública para los ejemplos, p. ej. https://api.cliente.com"),
+    ] = None,
+) -> None:
+    """Genera o actualiza README.md para el cliente (endpoints, campos, permisos...).
+
+    Se regenera solo lo que hay entre los marcadores `apigen:docs`; la introducción y
+    lo que escribas fuera de ellos se conserva. El idioma y la URL base se recuerdan
+    (van en el marcador). Ejecútalo al terminar la API."""
+    if lang is not None and lang not in {"en", "es"}:
+        _fail("--lang debe ser 'en' o 'es'")
+    if base_url is not None and not re.fullmatch(r"https?://[A-Za-z0-9.\-:\[\]/_~%]+", base_url):
+        _fail("--base-url debe ser una URL http(s):// sin espacios, p. ej. https://api.cliente.com")
+    from apigen.docs import write_readme
+
+    try:
+        path, created, lang = write_readme(project.root(), lang, base_url=base_url)
+    except SpecError as exc:
+        _fail(str(exc))
+    verb = "creado" if created else "actualizado"
+    typer.secho(f"✓ {path.name} {verb} ({lang})", fg=typer.colors.GREEN)
+    if created:
+        typer.echo("  Completa la introducción y el contacto (fuera de los marcadores).")
 
 
 @app.command()
@@ -622,8 +664,10 @@ async def _createsuperuser(email: str, promote: bool) -> None:
 
     try:
         TypeAdapter(EmailStr).validate_python(email)
-    except ValueError:
-        _fail("Email no válido")
+    except ValidationError as exc:
+        # El motivo de email-validator (p. ej. dominio reservado como .test; UX-65).
+        reason = exc.errors()[0].get("msg", "").removeprefix("value is not a valid email address: ")
+        _fail(f"Email no válido: {reason}")
     async with SessionFactory() as session:
         user = (await session.exec(select(User).where(User.email == email))).first()
         if user and not promote:
@@ -718,7 +762,9 @@ def worker(
         cmd += ["--concurrency", str(concurrency)]
     if once:
         cmd.append("--once")
-    raise typer.Exit(subprocess.call(cmd, cwd=base))  # noqa: S603
+    # El worker no necesita la clave de los JWT (SEC-38): no se le exige.
+    env = {**os.environ, "PROCESS_ROLE": "worker"}
+    raise typer.Exit(subprocess.call(cmd, cwd=base, env=env))  # noqa: S603
 
 
 @app.command()

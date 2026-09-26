@@ -14,7 +14,7 @@ import uuid
 from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import delete, func, update
+from sqlalchemy import delete, func, text, update
 from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -26,7 +26,9 @@ from app.models.job import PENDING_STATUSES, Job, JobStatus
 from app.schemas.job import JobAccepted
 from app.tasks.registry import get_task
 
-__all__ = ["JobAccepted", "cancel", "claim", "complete", "enqueue", "fail", "prune_jobs"]
+__all__ = [
+    "JobAccepted", "cancel", "claim", "complete", "enqueue", "fail", "prune_jobs", "touch",
+]  # fmt: skip
 
 logger = logging.getLogger("app.tasks")
 
@@ -57,6 +59,14 @@ async def enqueue(
         raise APIError(413, "Job payload too large", code="job_payload_too_large")
 
     if owner_id is not None and settings.JOBS_MAX_PENDING_PER_USER:
+        if settings.is_postgres:
+            # Serializa los encolados de un mismo usuario hasta el commit: sin esto, N
+            # peticiones a la vez contaban lo mismo y todas pasaban el límite (SEC-34).
+            # En SQLite (desarrollo) el exceso posible con ráfagas es pequeño.
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                {"key": f"apigen-jobs:{owner_id}"},
+            )
         pending = (
             await session.exec(
                 select(func.count())
@@ -129,13 +139,35 @@ async def claim(worker_id: str, limit: int) -> list[uuid.UUID]:
     return claimed
 
 
-async def complete(job_id: uuid.UUID, result: Any) -> None:
+def _leased(job_id: uuid.UUID, worker_id: str | None) -> list[Any]:
+    """Condición del UPDATE: el trabajo sigue en marcha y es de este worker (SEC-37)."""
+    conditions = [col(Job.id) == job_id]
+    if worker_id is not None:
+        conditions += [col(Job.status) == JobStatus.running, col(Job.locked_by) == worker_id]
+    return conditions
+
+
+async def touch(job_id: uuid.UUID, worker_id: str, seconds: float) -> bool:
+    """Renueva el arrendamiento (p. ej. cuando la tarea empieza de verdad a ejecutarse)."""
+    async with SessionFactory() as session:
+        result = await session.execute(
+            update(Job)
+            .where(*_leased(job_id, worker_id))
+            .values(locked_until=utcnow() + timedelta(seconds=seconds + settings.JOBS_LEASE_GRACE))
+        )
+        await session.commit()
+    return result.rowcount == 1
+
+
+async def complete(job_id: uuid.UUID, result: Any, *, worker_id: str | None = None) -> bool:
+    """Marca el trabajo como terminado. Con `worker_id`, solo si sigue siendo suyo:
+    devuelve False si otro worker lo reclamó entretanto (arrendamiento perdido)."""
     if result is not None and _json_size(result) > settings.JOBS_MAX_RESULT_BYTES:
         result = {"truncated": True, "detail": "Result too large to store"}
     async with SessionFactory() as session:
-        await session.execute(
+        done = await session.execute(
             update(Job)
-            .where(col(Job.id) == job_id)
+            .where(*_leased(job_id, worker_id))
             .values(
                 status=JobStatus.succeeded,
                 result=result,
@@ -146,6 +178,7 @@ async def complete(job_id: uuid.UUID, result: Any) -> None:
             )
         )
         await session.commit()
+    return done.rowcount == 1
 
 
 def backoff_seconds(attempt: int) -> int:
@@ -153,8 +186,13 @@ def backoff_seconds(attempt: int) -> int:
     return min(10 * 2 ** max(attempt - 1, 0), 600)
 
 
-async def fail(job_id: uuid.UUID, message: str, *, retry: bool) -> str:
-    """Registra un fallo. Devuelve el estado final (`queued` si se reintenta)."""
+async def fail(
+    job_id: uuid.UUID, message: str, *, retry: bool, worker_id: str | None = None
+) -> str:
+    """Registra un fallo. Devuelve el estado final (`queued` si se reintenta).
+
+    Con `worker_id`, un fallo tardío de un worker que ya perdió el arrendamiento no
+    toca el trabajo (p. ej. no devuelve a la cola uno que otro worker ya completó)."""
     async with SessionFactory() as session:
         job = await session.get(Job, job_id)
         if job is None:
@@ -168,8 +206,13 @@ async def fail(job_id: uuid.UUID, message: str, *, retry: bool) -> str:
             )
         else:
             values.update(status=JobStatus.failed, finished_at=utcnow())
-        await session.execute(update(Job).where(col(Job.id) == job_id).values(**values))
+        result = await session.execute(
+            update(Job).where(*_leased(job_id, worker_id)).values(**values)
+        )
         await session.commit()
+        if result.rowcount != 1:
+            logger.warning("job lease lost: failure not recorded", extra={"job_id": str(job_id)})
+            return "lease_lost"
         return values["status"]
 
 

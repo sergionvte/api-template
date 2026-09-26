@@ -20,6 +20,7 @@ from app.core.logging import setup_logging
 from app.core.middleware import (
     BodySizeLimitMiddleware,
     JSONTrustedHostMiddleware,
+    NullByteGuardMiddleware,
     RateLimitHeadersMiddleware,
     RequestContextMiddleware,
     SecurityHeadersMiddleware,
@@ -126,6 +127,9 @@ def create_app() -> FastAPI:
     app.add_middleware(UnhandledErrorMiddleware)
     if settings.GZIP_MIN_SIZE:
         app.add_middleware(GZipMiddleware, minimum_size=settings.GZIP_MIN_SIZE)
+    # Dentro de CORS: su 422 lleva las cabeceras CORS (si no, el navegador solo ve un
+    # error de red opaco).
+    app.add_middleware(NullByteGuardMiddleware)
     dev_cors = settings.ENVIRONMENT == "development" and not settings.CORS_ORIGINS
     if settings.CORS_ORIGINS or dev_cors:
         if dev_cors:

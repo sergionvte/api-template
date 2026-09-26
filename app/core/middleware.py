@@ -200,6 +200,53 @@ async def _send_413(send: Send) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
+class NullByteGuardMiddleware:
+    """Rechaza NUL (``\\x00`` o ``%00``) en la ruta o la query con un 422.
+
+    PostgreSQL no admite NUL en columnas de texto: sin esto, ``?q=%00`` llegaba a
+    la BD y acababa en un 500 (visto al validar con Docker + PostgreSQL). El
+    cuerpo JSON ya lo filtran los esquemas (`StrictInput`)."""
+
+    @staticmethod
+    def _body(where: str) -> bytes:
+        return (
+            b'{"detail":[{"loc":["' + where.encode() + b'"],"msg":"NUL character is not '
+            b'allowed","type":"null_character"}],"code":"validation_error"}'
+        )
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    @staticmethod
+    def _has_nul(value: bytes | str) -> bool:
+        return (
+            (b"%00" in value or b"\x00" in value) if isinstance(value, bytes) else ("\x00" in value)
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            where = None
+            if self._has_nul(scope.get("raw_path") or b"") or self._has_nul(scope.get("path", "")):
+                where = "path"
+            elif self._has_nul(scope.get("query_string", b"")):
+                where = "query"
+            if where is not None:
+                body = self._body(where)
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 422,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode()),
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
 class UnhandledErrorMiddleware:
     """Convierte excepciones no controladas en un 500 JSON *dentro* de la pila de
     middlewares, de modo que la respuesta sí lleva cabeceras de seguridad,

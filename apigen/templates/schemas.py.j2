@@ -54,12 +54,14 @@ class {{ cls }}Read(BaseModel):
 {% endfor %}
     created_at: datetime
     updated_at: datetime
-{% for a in actions if a.input_cls %}
+{% for a in actions %}
 
 
 class {{ a.input_cls }}(StrictInput):
-    """Cuerpo de la acción `{{ a.name }}`."""
+    """Cuerpo de la acción `{{ a.name }}`{{ "" if a.input_fields else " (sin campos: `{}` o sin cuerpo)" }}."""
+{% if a.input_fields %}
 
+{% endif %}
 {% for line in a.input_fields %}
     {{ line }}
 {% endfor %}

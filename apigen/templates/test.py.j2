@@ -16,7 +16,7 @@ from app.models.{{ s.module }} import {{ s.cls }}
 {% if has_background %}
 from app.tasks.worker import process_pending
 {% endif %}
-from tests.helpers import _like, _rand_int, _text, _uid
+from tests.helpers import _future_date, _future_datetime, _like, _rand_int, _text, _uid
 
 BASE = "/api/{{ version }}/{{ plural }}"
 {% set h = {"public": "{}", "user": "user_headers", "admin": "admin_headers"} %}
@@ -194,7 +194,9 @@ async def test_unknown_pagination_param_is_rejected(client, user_headers, admin_
 {% for a in actions %}
 
 
-async def test_action_{{ a.name }}(client, db, user, user_headers, admin, admin_headers):
+async def test_action_{{ a.name }}(
+    client, db, user, user_headers, admin, admin_headers{{ ", other_headers" if a.scope == "item" and a.scoped else "" }}
+):
 {% if a.scope == "item" %}
     payload = await _payload(db, {{ creator }}.id)
     created = await client.post(BASE, json=payload, headers={{ headers(perm.create) }})
@@ -204,6 +206,14 @@ async def test_action_{{ a.name }}(client, db, user, user_headers, admin, admin_
     url = f"{BASE}/{{ a.name }}"
 {% endif %}
     body = { {% for k, v in a.test_payload.items() %}{{ k | py }}: {{ v }}, {% endfor %} }
+    # Campos desconocidos en el cuerpo: 422, como en el resto de la API.
+    extra = await client.post(url, json={**body, "unexpected": 1}, headers={{ headers(a.perm) }})
+    assert extra.status_code == 422, extra.text
+{% if a.scope == "item" and a.scoped %}
+    # Solo el dueño (o un admin): para otro usuario la fila no existe.
+    other = await client.post(url, json=body, headers=other_headers)
+    assert other.status_code == 404, other.text
+{% endif %}
     response = await client.post(url, json=body, headers={{ headers(a.perm) }})
 {% if a.background %}
     # La API solo encola (202); el trabajo lo ejecuta el worker.

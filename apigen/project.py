@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 from apigen.codegen import (
     Rendered,
     ensure_user_module,
@@ -21,6 +23,8 @@ from apigen.spec import (
     ResourceSpec,
     SpecError,
     load_specs,
+    load_specs_with_sources,
+    spec_to_data,
     spec_to_yaml,
     validate_references,
 )
@@ -91,16 +95,66 @@ def load_all_specs(base: Path) -> dict[str, ResourceSpec]:
     return {s.name: s for s in load_specs(directory)}
 
 
-def save_spec(base: Path, spec: ResourceSpec) -> Path:
+def spec_sources(base: Path) -> dict[str, Path]:
+    """Fichero de resources/ que define cada recurso (falla si hay duplicados)."""
     directory = specs_dir(base)
-    directory.mkdir(exist_ok=True)
+    if not directory.exists():
+        return {}
+    return {spec.name: file for spec, file in load_specs_with_sources(directory)}
+
+
+def _same_spec(a: ResourceSpec, b: ResourceSpec) -> bool:
+    return a.model_dump() == b.model_dump()
+
+
+def check_spec_sources(base: Path, specs: list[ResourceSpec]) -> dict[str, Path]:
+    """Una sola fuente de verdad por recurso (UX-50).
+
+    Si un recurso ya está definido en otro fichero de resources/ (p. ej. un YAML con
+    varios recursos), ese fichero manda: generar desde él es válido, pero una
+    definición distinta (desde `apigen add` u otro YAML) se rechaza en vez de crear
+    una segunda copia que después pisaría a la primera sin avisar."""
+    sources = spec_sources(base)
+    for spec in specs:
+        source = sources.get(spec.name)
+        if source is None or source.name == f"{spec.name}.yaml":
+            continue
+        current = next(s for s, f in load_specs_with_sources(source) if s.name == spec.name)
+        if not _same_spec(current, spec):
+            raise SpecError(
+                f"'{spec.name}' ya está definido en {RESOURCES_DIR}/{source.name}: cambia la "
+                f"definición allí y ejecuta `apigen generate {RESOURCES_DIR} --force --only "
+                f"{spec.name}` (no se crea una segunda copia en {spec.name}.yaml)"
+            )
+    return sources
+
+
+def save_spec(base: Path, spec: ResourceSpec, sources: dict[str, Path] | None = None) -> str:
+    """Guarda resources/<nombre>.yaml y devuelve la línea para el log.
+
+    No escribe nada si el recurso ya está definido en otro fichero de resources/
+    (ese fichero es la fuente) ni si el fichero ya tiene esa misma definición: así
+    se conservan tus comentarios y tu formato (UX-50, UX-66)."""
+    directory = specs_dir(base)
+    sources = spec_sources(base) if sources is None else sources
+    source = sources.get(spec.name)
     path = directory / f"{spec.name}.yaml"
+    if source is not None and source != path:
+        return f"spec       {RESOURCES_DIR}/{source.name} (fuente de {spec.name}; no se duplica)"
+    if path.exists():
+        try:
+            current = load_specs(path)
+        except SpecError:
+            current = []
+        if len(current) == 1 and _same_spec(current[0], spec):
+            return f"spec       {path.relative_to(base)} (sin cambios)"
+    directory.mkdir(exist_ok=True)
     path.write_text(
         f"# Especificación de '{spec.name}'. Tras editarla ejecuta:\n"
         f"#   apigen generate --force --only {spec.name}\n" + spec_to_yaml(spec),
         encoding="utf-8",
     )
-    return path
+    return f"spec       {path.relative_to(base)}"
 
 
 def existing_versions(base: Path) -> list[str]:
@@ -150,6 +204,7 @@ def generate(
     save_specs: bool = True,
 ) -> list[str]:
     """Genera y registra recursos. Devuelve un log de acciones."""
+    sources = check_spec_sources(base, specs)
     known = load_all_specs(base)
     for spec in specs:
         known[spec.name] = spec
@@ -202,8 +257,7 @@ def generate(
             if insert_before_marker(router_file, "routers", inc):
                 log.append(f"registrado router /{version}/{spec.plural}")
         if save_specs:
-            path = save_spec(base, spec)
-            log.append(f"spec       {path.relative_to(base)}")
+            log.append(save_spec(base, spec, sources))
 
     # Módulos del usuario: se crean una vez y NUNCA se sobrescriben (ni con --force).
     created: list[Path] = []
@@ -276,6 +330,12 @@ def remove(base: Path, name: str, *, keep_spec: bool = False, force: bool = Fals
             log.append(f"conservado {rel} (tu código; bórralo a mano si ya no lo quieres)")
     if not keep_spec:
         paths.append(specs_dir(base) / f"{spec.name}.yaml")
+        source = spec_sources(base).get(name)
+        if source is not None and source.name != f"{name}.yaml":
+            log.append(
+                f"AVISO      {name} sigue definido en {RESOURCES_DIR}/{source.name}: "
+                "quítalo de ese fichero o volverá a generarse"
+            )
     for path in paths:
         if path.exists():
             path.unlink()
@@ -347,10 +407,33 @@ def add_version(base: Path, new: str, source: str) -> list[str]:
     insert_before_marker(versions_file, "versions", line)
     log.append(f"registrada versión {new}")
 
+    sources = spec_sources(base)
+    rewrite: set[Path] = set()
     for spec in load_all_specs(base).values():
         if source in spec.versions and new not in spec.versions:
             spec.versions.append(new)
-            save_spec(base, spec)
+            file = sources[spec.name]
+            if file.name == f"{spec.name}.yaml":
+                save_spec(base, spec, sources)
+            else:
+                rewrite.add(file)
+    # Ficheros con varios recursos: se reescriben enteros (es su única fuente; UX-50).
+    for file in rewrite:
+        updated = load_specs(file)
+        for spec in updated:
+            if source in spec.versions and new not in spec.versions:
+                spec.versions.append(new)
+        body = yaml.safe_dump(
+            {"resources": [spec_to_data(spec) for spec in updated]},
+            sort_keys=False,
+            allow_unicode=True,
+        )
+        file.write_text(
+            "# Recursos de la API (varios en un fichero). Tras editarlo ejecuta:\n"
+            f"#   apigen generate {RESOURCES_DIR} --force\n" + body,
+            encoding="utf-8",
+        )
+        log.append(f"reescrito  {file.relative_to(base)} (añadida {new}; sin comentarios)")
     log.append(f"specs actualizadas: los recursos de {source} ahora también están en {new}")
     return log
 

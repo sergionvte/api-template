@@ -4,6 +4,17 @@
 !.env.example
 keys/
 *.pem
+# Claves, credenciales y volcados: nunca al repositorio (ni al de un cliente).
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+credentials*.json
+*.sqlite
+*.sqlite3
+*.sql
+*.dump
 
 # Python
 __pycache__/

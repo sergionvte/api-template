@@ -159,3 +159,24 @@ def test_keyboard_sequences_are_rejected():
     for weak in ("qwertyuiopas", "1qaz2wsx3edc", "abcdefghijklm", "lkjhgfdsapoiu"):
         assert password_problems(weak), weak
     assert password_problems("tren azul de medianoche") == []
+
+
+def test_worker_does_not_need_the_jwt_secret():
+    """SEC-38: el worker arranca en producción sin SECRET_KEY (no firma tokens); la API no."""
+    worker = _prod(PROCESS_ROLE="worker", SECRET_KEY="", ALLOWED_HOSTS=["*"], TRUSTED_PROXIES=[])
+    assert len(worker.SECRET_KEY.get_secret_value()) >= 32  # efímera, solo en memoria
+    with pytest.raises(ValidationError, match="SECRET_KEY"):
+        _prod(SECRET_KEY="")
+    with pytest.raises(ValidationError, match="DEBUG"):
+        _prod(PROCESS_ROLE="worker", SECRET_KEY="", DEBUG=True)  # lo común sigue aplicando
+
+
+async def test_createsuperuser_explains_invalid_email(capsys):
+    """UX-65: el motivo del rechazo (dominio reservado) llega al usuario."""
+    import typer
+
+    from apigen.cli import _createsuperuser
+
+    with pytest.raises(typer.Exit):
+        await _createsuperuser("admin@gym.test", promote=False)
+    assert "special-use or reserved" in capsys.readouterr().err

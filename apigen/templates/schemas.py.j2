@@ -1,0 +1,66 @@
+"""Esquemas de entrada/salida de `{{ name }}` (generados por apigen, puedes editarlos).
+
+- `{{ cls }}Create`: lo que el cliente puede enviar al crear (campos extra -> 422).
+- `{{ cls }}Update`: PATCH parcial; solo se modifican los campos enviados.
+- `{{ cls }}Read`: lo que la API devuelve (nunca incluye campos write_only).
+"""
+
+import uuid
+from datetime import datetime
+{{ schema_imports }}
+
+from pydantic import BaseModel, ConfigDict, Field
+
+{% if enums %}
+from app.models.{{ name }} import {% for e in enums.values() %}{{ e.cls }}{{ ", " if not loop.last }}{% endfor %}
+
+{% endif %}
+from app.schemas.common import PartialUpdate, StrictInput
+
+
+class {{ cls }}Create(StrictInput):
+{% for line in create_fields %}
+    {{ line }}
+{% endfor %}
+
+
+class {{ cls }}Update(PartialUpdate):
+{% if non_nullable %}
+    __non_nullable__ = frozenset({{ '{' }}{% for n in non_nullable %}{{ n | py }}{{ ", " if not loop.last }}{% endfor %}{{ '}' }})
+{% endif %}
+{% if immutable %}
+    # Campos que solo se fijan al crear: enviarlos en PATCH da un 422 `immutable_field`.
+    __immutable__ = frozenset({{ '{' }}{% for n in immutable %}{{ n | py }}{{ ", " if not loop.last }}{% endfor %}{{ '}' }})
+{% endif %}
+{% if non_nullable or immutable %}
+
+{% endif %}
+{% for line in update_fields %}
+    {{ line }}
+{% else %}
+    pass
+{% endfor %}
+
+
+class {{ cls }}Read(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+{% if spec.owned %}
+    owner_id: uuid.UUID
+{% endif %}
+{% for line in read_fields %}
+    {{ line }}
+{% endfor %}
+    created_at: datetime
+    updated_at: datetime
+{% for a in actions if a.input_cls %}
+
+
+class {{ a.input_cls }}(StrictInput):
+    """Cuerpo de la acción `{{ a.name }}`."""
+
+{% for line in a.input_fields %}
+    {{ line }}
+{% endfor %}
+{% endfor %}

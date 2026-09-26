@@ -1,0 +1,223 @@
+"""Tests de `{{ plural }}` ({{ version }}), generados por apigen.
+
+Cubren el CRUD completo, permisos, aislamiento entre usuarios y asignación masiva.
+Si cambias los endpoints a mano, ajusta estos tests en consecuencia.
+"""
+
+import uuid
+from datetime import date, datetime
+from decimal import Decimal
+
+import pytest
+
+{% for s in test.setup %}
+from app.models.{{ s.module }} import {{ s.cls }}
+{% endfor %}
+{% if has_background %}
+from app.tasks.worker import process_pending
+{% endif %}
+from tests.helpers import _like, _rand_int, _text, _uid
+
+BASE = "/api/{{ version }}/{{ plural }}"
+{% set h = {"public": "{}", "user": "user_headers", "admin": "admin_headers"} %}
+{% set creator = "admin" if perm.create == "admin" else "user" %}
+{% macro headers(level) -%}
+{{ (creator ~ "_headers") if level == "owner" else h[level] }}
+{%- endmacro %}
+{% if not test.supported %}
+
+pytestmark = pytest.mark.skip(reason="apigen no pudo generar datos de prueba (FKs anidadas); completa el test a mano")
+{% endif %}
+
+
+async def _payload(db, owner_id: uuid.UUID) -> dict:
+    """Payload válido. Crea antes las filas padre que exigen las claves foráneas."""
+{% for s in test.setup %}
+    {{ s.var }} = {{ s.cls }}({% for k, v in s.attrs.items() %}{{ k }}={{ v }}{{ ", " if not loop.last }}{% endfor %})
+    db.add({{ s.var }})
+    await db.commit()
+{% endfor %}
+    return {
+{% for k, v in test.payload.items() %}
+        {{ k | py }}: {{ v }},
+{% endfor %}
+    }
+
+
+async def test_crud_flow(client, db, user, user_headers, admin, admin_headers):
+    payload = await _payload(db, {{ creator }}.id)
+    created = await client.post(BASE, json=payload, headers={{ headers(perm.create) }})
+    assert created.status_code == 201, created.text
+    body = created.json()
+    item_id = body["id"]
+{% for f in test.write_only %}
+    assert {{ f | py }} not in body
+{% endfor %}
+{% if spec.owned %}
+    assert body["owner_id"] == str({{ creator }}.id)
+{% endif %}
+
+    got = await client.get(f"{BASE}/{item_id}", headers={{ headers(perm.read) }})
+    assert got.status_code == 200, got.text
+
+    listed = await client.get(BASE, params={"limit": 100}, headers={{ headers(perm.list) }})
+    assert listed.status_code == 200, listed.text
+    assert item_id in [row["id"] for row in listed.json()["items"]]
+
+{% if test.update_field %}
+    new_value = {{ test.update_field[1] }}
+    updated = await client.patch(
+        f"{BASE}/{item_id}", json={ {{ test.update_field[0] | py }}: new_value}, headers={{ headers(perm.update) }}
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()[{{ test.update_field[0] | py }}] == new_value
+{% else %}
+    updated = await client.patch(f"{BASE}/{item_id}", json={}, headers={{ headers(perm.update) }})
+    assert updated.status_code == 200, updated.text
+{% endif %}
+
+    deleted = await client.delete(f"{BASE}/{item_id}", headers={{ headers(perm.delete) }})
+    assert deleted.status_code == 204, deleted.text
+    gone = await client.get(f"{BASE}/{item_id}", headers={{ headers(perm.read) }})
+    assert gone.status_code == 404
+
+
+async def test_rejects_unknown_fields(client, db, user, user_headers, admin, admin_headers):
+    """Asignación masiva: no se pueden colar campos como id u owner_id."""
+    payload = await _payload(db, {{ creator }}.id)
+    payload.update({"id": str(uuid.uuid4()), "owner_id": str(uuid.uuid4()), "is_admin": True})
+    response = await client.post(BASE, json=payload, headers={{ headers(perm.create) }})
+    assert response.status_code == 422
+
+
+async def test_invalid_ordering_rejected(client, user_headers, admin_headers):
+    response = await client.get(BASE, params={"order_by": "hashed_password"}, headers={{ headers(perm.list) }})
+    assert response.status_code == 422
+{% if perm.create != "public" %}
+
+
+async def test_create_requires_auth(client, db, user):
+    payload = await _payload(db, user.id)
+    response = await client.post(BASE, json=payload)
+    assert response.status_code == 401
+{% endif %}
+{% if perm.create == "admin" %}
+
+
+async def test_create_forbidden_for_regular_user(client, db, user, user_headers):
+    payload = await _payload(db, user.id)
+    response = await client.post(BASE, json=payload, headers=user_headers)
+    assert response.status_code == 403
+{% endif %}
+{% if perm.create != "public" %}
+
+
+async def test_read_only_token_cannot_write(client, db, {{ creator }}):
+    from tests.conftest import headers_for
+
+    payload = await _payload(db, {{ creator }}.id)
+    response = await client.post(BASE, json=payload, headers=headers_for({{ creator }}, ["read"]))
+    assert response.status_code == 403
+{% endif %}
+{% if spec.owned and perm.read == "owner" %}
+
+
+async def test_owner_isolation(client, db, user, user_headers, other_headers):
+    """Otro usuario no puede ver, modificar ni borrar filas ajenas (404, no 403)."""
+    payload = await _payload(db, user.id)
+    created = await client.post(BASE, json=payload, headers=user_headers)
+    assert created.status_code == 201, created.text
+    item_id = created.json()["id"]
+
+    assert (await client.get(f"{BASE}/{item_id}", headers=other_headers)).status_code == 404
+    listed = await client.get(BASE, params={"limit": 100}, headers=other_headers)
+    assert item_id not in [row["id"] for row in listed.json()["items"]]
+{% if perm.update == "owner" %}
+    assert (await client.patch(f"{BASE}/{item_id}", json={}, headers=other_headers)).status_code == 404
+{% endif %}
+{% if perm.delete == "owner" %}
+    assert (await client.delete(f"{BASE}/{item_id}", headers=other_headers)).status_code == 404
+{% endif %}
+{% endif %}
+{% if test.unique_field %}
+
+
+async def test_unique_{{ test.unique_field }}(client, db, user, user_headers, admin, admin_headers):
+    payload = await _payload(db, {{ creator }}.id)
+    first = await client.post(BASE, json=payload, headers={{ headers(perm.create) }})
+    assert first.status_code == 201, first.text
+    second = await client.post(BASE, json=payload, headers={{ headers(perm.create) }})
+    assert second.status_code == 409
+    assert second.json()["code"] == "unique_violation"
+    # Con varios campos únicos, la BD informa del primero que falla.
+    assert set(second.json()["fields"]) <= {{ '{' }}{% for n in test.unique_fields %}{{ n | py }}{{ ", " if not loop.last }}{% endfor %}{{ '}' }}
+{% if spec.soft_delete %}
+    # Con soft delete, un valor borrado se puede volver a usar (índice único parcial).
+    deleted = await client.delete(f"{BASE}/{first.json()['id']}", headers={{ headers(perm.delete) }})
+    assert deleted.status_code == 204
+    again = await client.post(BASE, json=payload, headers={{ headers(perm.create) }})
+    assert again.status_code == 201, again.text
+{% endif %}
+{% endif %}
+{% if test.int_field %}
+
+
+async def test_int_out_of_range_is_422(client, db, user, user_headers, admin, admin_headers):
+    """Un entero fuera de 64 bits da 422, no un 500 por desbordamiento en la BD."""
+    payload = await _payload(db, {{ creator }}.id)
+    payload[{{ test.int_field | py }}] = 2**63
+    response = await client.post(BASE, json=payload, headers={{ headers(perm.create) }})
+    assert response.status_code == 422, response.text
+{% endif %}
+{% if test.immutable_field %}
+
+
+async def test_immutable_field_rejected_on_patch(client, db, user, user_headers, admin, admin_headers):
+    payload = await _payload(db, {{ creator }}.id)
+    created = await client.post(BASE, json=payload, headers={{ headers(perm.create) }})
+    assert created.status_code == 201, created.text
+    response = await client.patch(
+        f"{BASE}/{created.json()['id']}",
+        json={ {{ test.immutable_field[0] | py }}: {{ test.immutable_field[1] }} },
+        headers={{ headers(perm.update) }},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["type"] == "immutable_field"
+{% endif %}
+
+
+async def test_unknown_pagination_param_is_rejected(client, user_headers, admin_headers):
+    """`page`/`size` no existen (se usa limit/offset): 422 en vez de ignorarlos."""
+    response = await client.get(BASE, params={"page": 2}, headers={{ headers(perm.list) }})
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["type"] == "unknown_parameter"
+{% for a in actions %}
+
+
+async def test_action_{{ a.name }}(client, db, user, user_headers, admin, admin_headers):
+{% if a.scope == "item" %}
+    payload = await _payload(db, {{ creator }}.id)
+    created = await client.post(BASE, json=payload, headers={{ headers(perm.create) }})
+    assert created.status_code == 201, created.text
+    url = f"{BASE}/{created.json()['id']}/{{ a.name }}"
+{% else %}
+    url = f"{BASE}/{{ a.name }}"
+{% endif %}
+    body = { {% for k, v in a.test_payload.items() %}{{ k | py }}: {{ v }}, {% endfor %} }
+    response = await client.post(url, json=body, headers={{ headers(a.perm) }})
+{% if a.background %}
+    # La API solo encola (202); el trabajo lo ejecuta el worker.
+    assert response.status_code == 202, response.text
+    job = response.json()
+    assert response.headers["location"] == job["status_url"]
+    await process_pending()
+    done = await client.get(job["status_url"], headers={{ headers(a.perm) }})
+    assert done.status_code == 200, done.text
+    assert done.json()["status"] == "succeeded", done.json()
+{% else %}
+    assert response.status_code == 200, response.text
+{% endif %}
+{% if a.perm != "public" %}
+    assert (await client.post(url, json=body)).status_code == 401
+{% endif %}
+{% endfor %}

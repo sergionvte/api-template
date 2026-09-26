@@ -1,0 +1,89 @@
+# Entorno completo: API + PostgreSQL + Redis, siempre en modo producción.
+#   apigen init-env --production   (genera SECRET_KEY y POSTGRES_PASSWORD)
+#   edita .env: ALLOWED_HOSTS (obligatorio), CORS_ORIGINS...
+#   docker compose up --build
+# Pon delante un proxy inverso con HTTPS que envíe X-Forwarded-For/-Proto.
+services:
+  api:
+    build: .
+    env_file: .env
+    environment:
+      # `environment` tiene prioridad sobre `env_file`: un .env de desarrollo no
+      # puede desactivar las validaciones de producción (SEC-03).
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+asyncpg://api:${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}@db:5432/api
+      # Timeouts cortos: un Redis colgado no debe bloquear las peticiones.
+      RATE_LIMIT_STORAGE_URI: redis://redis:6379/0?socket_timeout=0.5&socket_connect_timeout=0.5
+      # Solo se confía en X-Forwarded-For/-Proto del gateway de la red `backend`: es la
+      # IP con la que llega al contenedor un proxy del HOST (nginx/Caddy en el host
+      # conectando a 127.0.0.1:8000). Si tu proxy es otro contenedor, dale una IP
+      # fija en `backend` (ipv4_address) y pon esa IP aquí. Nunca un rango amplio
+      # (SEC-21/22). El proxy debe SOBRESCRIBIR X-Forwarded-For, no añadir.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.30.57.1}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    tmpfs: [/tmp]
+    networks: [backend]
+    restart: unless-stopped
+
+  # Worker de tareas en segundo plano: proceso aparte para que los trabajos
+  # pesados no ralenticen la API. Escala con: docker compose up --scale worker=3
+  worker:
+    build: .
+    env_file: .env
+    command: ["python", "-m", "app.tasks.worker"]
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+asyncpg://api:${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}@db:5432/api
+      RATE_LIMIT_STORAGE_URI: redis://redis:6379/0?socket_timeout=0.5&socket_connect_timeout=0.5
+    depends_on:
+      db: {condition: service_healthy}
+      api: {condition: service_started}  # la API aplica las migraciones al arrancar
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    tmpfs: [/tmp]
+    networks: [backend]
+    stop_grace_period: 40s  # deja terminar los trabajos en curso (JOBS_SHUTDOWN_GRACE)
+    restart: unless-stopped
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: api
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}
+      POSTGRES_DB: api
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U api -d api"]
+      interval: 5s
+      retries: 10
+    networks: [backend]
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+    networks: [backend]
+    restart: unless-stopped
+
+networks:
+  backend:
+    # Subred fija: así TRUSTED_PROXIES puede ser una IP exacta (el gateway).
+    ipam:
+      config:
+        - subnet: 172.30.57.0/24
+          gateway: 172.30.57.1
+
+volumes:
+  pgdata:

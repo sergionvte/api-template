@@ -1,0 +1,42 @@
+"""Modelo de tabla `{{ table }}` (generado por apigen, puedes editarlo).
+
+Tras cambiar columnas crea una migración: `apigen db migrate -m "..."`.
+"""
+
+{% if spec.owned %}
+import uuid
+{% endif %}
+{% if enums %}
+from enum import StrEnum
+{% endif %}
+{{ model_imports }}
+
+from sqlmodel import Field
+
+from app.models.base import IDMixin{% if spec.soft_delete %}, SoftDeleteMixin{% endif %}, TimestampMixin
+{% for fname, enum in enums.items() %}
+
+
+class {{ enum.cls }}(StrEnum):
+{% for ident, value in enum.members %}
+    {{ ident }} = {{ value | py }}
+{% endfor %}
+{% endfor %}
+
+
+class {{ cls }}(IDMixin, TimestampMixin{% if spec.soft_delete %}, SoftDeleteMixin{% endif %}, table=True):
+    __tablename__ = {{ table | py }}
+{% if table_args %}
+    __table_args__ = (
+{% for arg in table_args %}
+        {{ arg }},
+{% endfor %}
+    )
+{% endif %}
+
+{% if spec.owned %}
+    owner_id: uuid.UUID = Field(foreign_key="users.id", ondelete="CASCADE", index=True)
+{% endif %}
+{% for line in table_fields %}
+    {{ line }}
+{% endfor %}

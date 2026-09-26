@@ -1,0 +1,73 @@
+# Tour completo (ver guía): plataforma de cursos que usa todas las opciones de apigen.
+#   apigen generate examples/cursos.yaml --migrate
+resources:
+  - name: category
+    plural: categories
+    description: Categorías del catálogo
+    permissions: {list: public, read: public}
+    fields:
+      name: {type: str, max_length: 80, unique: true}
+      slug: {type: str, max_length: 80, unique: true, immutable: true, pattern: "^[a-z0-9-]+$", example: backend-python}
+      description: {type: text, nullable: true}
+    search: [name]
+    ordering: [name]
+
+  - name: course
+    description: Cursos a la venta
+    soft_delete: true
+    permissions: {list: public, read: public}
+    rate_limits: {read: "300/minute", write: "30/minute"}
+    fields:
+      title: {type: str, max_length: 120, index: true}
+      price: {type: decimal, max_digits: 8, decimal_places: 2, ge: 0}
+      level: {type: enum, choices: [beginner, intermediate, advanced], default: beginner}
+      duration_hours: {type: float, gt: 0, le: 500}
+      published: {type: bool, default: false}
+      starts_on: {type: date, nullable: true}
+      syllabus: {type: json, nullable: true}
+      instructor_email: {type: email}
+      external_id: {type: uuid, nullable: true, unique: true}
+      category_id: {type: fk, to: category, nullable: true, on_delete: set_null}
+    filters: [level, published, category_id]
+    search: [title]
+    ordering: [price, title, starts_on]
+    actions:
+      - name: reindex
+        scope: collection
+        background: true
+        permission: admin
+        executor: process
+        timeout: 120
+
+  - name: enrollment
+    description: Inscripciones; cada alumno solo ve las suyas
+    owned: true
+    fields:
+      course_id: {type: fk, to: course, on_delete: restrict}
+      progress: {type: int, ge: 0, le: 100, default: 0}
+      completed_at: {type: datetime, nullable: true}
+      private_notes: {type: text, max_length: 1000, nullable: true, write_only: true}
+    filters: [course_id]
+    ordering: [progress]
+    actions:
+      - name: certificate
+        background: true
+        rate_limit: "5/minute"
+        description: Genera el certificado en PDF en segundo plano
+        fields:
+          language: {type: str, max_length: 5, default: es}
+      - name: summary
+        description: Resumen rápido de la inscripción
+
+  - name: review
+    description: Reseñas públicas; cada autor edita las suyas
+    owned: true
+    shared_read: true
+    soft_delete: true
+    permissions: {list: public, read: public}
+    fields:
+      course_id: {type: fk, to: course, on_delete: cascade}
+      rating: {type: int, ge: 1, le: 5}
+      comment: {type: text, max_length: 2000, nullable: true}
+    filters: [course_id, rating]
+    ordering: [rating]

@@ -1,0 +1,28 @@
+# Modelos genéricos SOLO para pruebas de carga. run_loadtest.sh los genera en una
+# copia temporal del proyecto: nunca ensucian la plantilla.
+resources:
+  - name: bench_product
+    description: Catálogo público de lectura intensiva
+    permissions: {list: public, read: public}
+    fields:
+      name: {type: str, max_length: 120, index: true}
+      sku: {type: str, max_length: 32, unique: true}
+      price: {type: decimal, max_digits: 10, decimal_places: 2, ge: 0}
+      stock: {type: int, ge: 0, default: 0}
+      active: {type: bool, default: true}
+      category: {type: enum, choices: [books, games, music, tools], default: books}
+    filters: [active, category]
+    search: [name]
+    ordering: [price, name]
+
+  - name: bench_note
+    description: Datos privados por usuario (escritura intensiva)
+    owned: true
+    fields:
+      title: {type: str, max_length: 200}
+      body: {type: text, max_length: 2000, nullable: true}
+      pinned: {type: bool, default: false}
+      product_id: {type: fk, to: bench_product, nullable: true}
+    filters: [pinned]
+    search: [title]
+    ordering: [title]

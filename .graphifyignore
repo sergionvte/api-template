@@ -1,0 +1,6 @@
+# Artefactos generados que no aportan al grafo (y gastarían tokens)
+loadtests/reports/
+graphify-out/
+uv.lock
+*.db
+*.db-*

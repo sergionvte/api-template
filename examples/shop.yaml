@@ -1,0 +1,65 @@
+# Ejemplo completo: apigen generate examples/shop.yaml
+resources:
+  - name: category
+    plural: categories
+    description: Categorías del catálogo (solo admins las gestionan)
+    permissions: {list: public, read: public}
+    fields:
+      name: {type: str, max_length: 80, unique: true}
+      slug: {type: str, max_length: 80, unique: true, pattern: "^[a-z0-9-]+$", example: "my-category", immutable: true}
+      description: {type: text, nullable: true}
+    search: [name]
+    ordering: [name]
+
+  - name: product
+    description: Productos a la venta
+    soft_delete: true
+    permissions: {list: public, read: public}
+    rate_limits: {read: "300/minute", write: "60/minute"}
+    fields:
+      name: {type: str, max_length: 120, index: true}
+      sku: {type: str, max_length: 32, unique: true}
+      price: {type: decimal, max_digits: 10, decimal_places: 2, ge: 0}
+      stock: {type: int, ge: 0, default: 0}
+      rating: {type: float, ge: 0, le: 5, nullable: true}
+      active: {type: bool, default: true}
+      status: {type: enum, choices: [draft, published, archived], default: draft}
+      released_on: {type: date, nullable: true}
+      attributes: {type: json, nullable: true}
+      category_id: {type: fk, to: category}
+    filters: [active, status, category_id]
+    search: [name, sku]
+    ordering: [price, name, stock]
+    actions:
+      # Proceso pesado de CPU en un proceso aparte del worker (no frena la API).
+      - name: reindex
+        scope: collection
+        background: true
+        permission: admin
+        executor: process
+        timeout: 120
+
+  - name: order
+    description: Pedidos; cada usuario solo ve los suyos
+    owned: true
+    fields:
+      product_id: {type: fk, to: product}
+      quantity: {type: int, ge: 1, le: 100}
+      notes: {type: text, max_length: 500, nullable: true}
+      delivery_at: {type: datetime, nullable: true}
+      tracking_code: {type: uuid, nullable: true}
+      contact_email: {type: email}
+      internal_ref: {type: str, max_length: 40, write_only: true, nullable: true}
+    filters: [product_id]
+    ordering: [quantity]
+    actions:
+      # Endpoint en segundo plano: responde 202 con el job_id y lo hace el worker.
+      - name: export_invoice
+        background: true
+        rate_limit: "10/minute"
+        description: Genera la factura del pedido en segundo plano
+        fields:
+          format: {type: str, max_length: 10, default: pdf}
+      # Acción síncrona (rápida): su lógica va en app/hooks/order.py.
+      - name: summary
+        description: Resumen rápido del pedido

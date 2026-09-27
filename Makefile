@@ -1,4 +1,4 @@
-.PHONY: install env dev test lint format migrate check audit loadtest graph graph-query worker new-api docs deliver
+.PHONY: install env dev test lint format migrate check audit loadtest graph graph-query worker mail new-api docs deliver
 
 install:        ## Instala dependencias (incluye dev)
 	uv sync
@@ -11,6 +11,10 @@ dev:            ## Servidor de desarrollo con recarga
 
 worker:         ## Worker de tareas en segundo plano (en otra terminal junto a `make dev`)
 	uv run apigen worker
+
+mail:           ## Mailpit para probar correos en local (bandeja en http://localhost:8025)
+	docker compose -f compose.mail.yml up -d
+	@echo "Mailpit: http://localhost:8025 · en .env: EMAIL_BACKEND=smtp SMTP_HOST=localhost SMTP_PORT=1025 SMTP_SECURITY=none"
 
 test:           ## Tests
 	uv run pytest -q

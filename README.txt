@@ -54,6 +54,15 @@ partir de una línea de comandos o de un fichero YAML.
     - Validación de configuración: en producción la app no arranca si detecta
       valores inseguros (clave débil, CORS "*", hosts "*", DEBUG...).
 
+  Cuentas y correo (desactivado por defecto; se activa por cliente en .env)
+    - Verificación de email (off | optional | required) y recuperación de
+      contraseña con tokens de un solo uso (solo su hash en BD), enlaces al
+      frontend del cliente (FRONTEND_URL, token en el fragmento #) y
+      respuestas que no revelan si una cuenta existe.
+    - Correo por la cola del worker con backends intercambiables: console,
+      file, smtp (cualquier proveedor), disabled y custom; plantillas es/en con
+      la marca del cliente, sobrescribibles en email_templates/. Ver sección 15.
+
   Versionado
     - /api/v1, /api/v2... `apigen version add v2 --from v1` y
       `apigen version deprecate v1 --sunset AAAA-MM-DD` (cabeceras Deprecation
@@ -170,13 +179,24 @@ partir de una línea de comandos o de un fichero YAML.
   apigen db migrate [-m "mensaje"] [--verbose]     autogenerar y aplicar migración
   apigen db upgrade | downgrade | current | history   (--verbose: log de Alembic)
   apigen db prune                                  purga refresh tokens antiguos
-                                                   (retención de IPs; a diario)
+                                                   (retención de IPs; a diario),
+                                                   tokens de cuenta y registro
+                                                   de envíos de correo
   apigen init-env [--production]                   crear .env
   apigen secret                                    generar SECRET_KEY
   apigen createsuperuser [--email] [--promote]     crear administrador (sin
                                                    terminal: variable
                                                    APIGEN_SUPERUSER_PASSWORD)
-  apigen check                                     validar configuración
+  apigen check                                     validar configuración (y
+                                                   las plantillas de correo)
+  apigen email test DESTINO [--lang es]            envía YA un correo de prueba
+                                                   (errores del proveedor
+                                                   explicados)
+  apigen email preview [PLANTILLA] [--lang]        HTML/texto en var/mail/preview
+  apigen email eject [PLANTILLA|layout] [--lang]   copia plantillas de serie a
+                                                   email_templates/ para editarlas
+  apigen users verify --email X | --all-existing   marca emails como verificados
+                  [--before AAAA-MM-DD] [-y]       (auditado; al pasar a required)
   apigen run                                       servidor de desarrollo
   apigen serve [--workers N]                       servidor de producción
 
@@ -195,9 +215,20 @@ partir de una línea de comandos o de un fichero YAML.
   POST   /api/v1/auth/logout          cierra una sesión (el access token sigue
                                       valiendo hasta caducar; logout-all no)
   POST   /api/v1/auth/logout-all      cierra todas las sesiones
+  GET    /api/v1/auth/features        flujos de cuenta activos (para el frontend)
+  POST   /api/v1/auth/password/forgot           pide enlace de recuperación (202
+                                                siempre)          [PASSWORD_RESET]
+  POST   /api/v1/auth/password/reset/validate   ¿sigue valiendo el token? (204/400)
+  POST   /api/v1/auth/password/reset            contraseña nueva con el token (204)
+  POST   /api/v1/auth/email/verify              verifica el email o confirma un
+                                                cambio de email (204)
+  POST   /api/v1/auth/email/verify/resend       reenvía la verificación (202
+                                                siempre)      [EMAIL_VERIFICATION]
   GET    /api/v1/users/me             perfil
   PATCH  /api/v1/users/me             editar perfil
   POST   /api/v1/users/me/password    cambiar contraseña
+  POST   /api/v1/users/me/email       pedir cambio de email (se confirma con el
+                                      enlace enviado a la dirección nueva)
   GET    /api/v1/users                (admin) listar/buscar usuarios
   POST   /api/v1/users                (admin) crear usuario con rol
   GET    /api/v1/users/{id}           (admin)
@@ -217,6 +248,11 @@ partir de una línea de comandos o de un fichero YAML.
     403 forbidden | insufficient_scope
     404 not_found
     400 invalid_host (cabecera Host fuera de ALLOWED_HOSTS)
+        invalid_or_expired_token (enlace de recuperación/verificación malo,
+        caducado o usado) | wrong_password | same_email
+    403 email_not_verified (login con EMAIL_VERIFICATION=required y la
+        contraseña correcta) | password_reset_disabled |
+        email_verification_disabled | email_change_disabled
     409 unique_violation (+ "fields") | has_dependents | reference_violation
         email_taken | refresh_token_rotated (ver abajo) | last_admin | self_delete
     413 body_too_large     415 login_expects_form | expects_json
@@ -271,6 +307,10 @@ partir de una línea de comandos o de un fichero YAML.
     ALLOWED_HOSTS          dominios reales en producción
     CORS_ORIGINS           orígenes del frontend
     TRUSTED_PROXIES        IP/CIDR del proxy inverso (para X-Forwarded-For)
+    EMAIL_VERIFICATION     off | optional | required (sección 15)
+    PASSWORD_RESET         on | off
+    EMAIL_BACKEND          console | file | smtp | disabled | custom
+    FRONTEND_URL           URL del frontend del cliente (enlaces de los correos)
 
   `apigen check` muestra un resumen y avisa de configuraciones débiles.
   Una variable vacía en .env (VAR=) equivale a no definirla (valor por defecto).
@@ -348,13 +388,20 @@ partir de una línea de comandos o de un fichero YAML.
     [ ] ALLOWED_HOSTS, CORS_ORIGINS y TRUSTED_PROXIES con valores reales
     [ ] HTTPS terminado en el proxy, que envíe X-Forwarded-Proto (HSTS se
         envía si el esquema visto es https)
-    [ ] ¿Registro abierto? (ALLOW_REGISTRATION; sin verificación de email).
-        Si es público, añade una lista de contraseñas comprometidas (pendiente)
+    [ ] ¿Registro abierto? (ALLOW_REGISTRATION). Si es público, activa la
+        verificación de email (EMAIL_VERIFICATION=required) y añade una lista
+        de contraseñas comprometidas (pendiente)
+    [ ] Correo (si hay verificación o recuperación): EMAIL_BACKEND=smtp, SMTP_*,
+        EMAIL_FROM del dominio del cliente con SPF, DKIM y DMARC, FRONTEND_URL
+        https y en CORS_ORIGINS. Prueba: `docker compose exec worker apigen
+        email test tu@example.com` (sección 15)
     [ ] `apigen check` sin avisos y `make audit` (dependencias) sin hallazgos,
         también en CI
     [ ] `apigen db prune` programado a diario (retención de IPs)
     [ ] Alerta sobre app.audit: event=auth.account.locked con nivel ERROR
-        (admin bloqueado) y picos de auth.login.failure / auth.register
+        (admin bloqueado), picos de auth.login.failure / auth.register y los
+        eventos de correo con nivel ERROR (email.send.failed: credenciales o
+        TLS rechazados; email.suppressed con reason=circuit_open: cortacircuitos)
 
   Pendiente de verificar en un entorno real (no se pudo en la revisión: no
   había PostgreSQL, Redis ni Docker):
@@ -376,10 +423,17 @@ partir de una línea de comandos o de un fichero YAML.
   en .claude/agents/.
 
   Riesgos aceptados y documentados:
-    - El registro responde 409 email_taken si el email existe (enumeración).
-      Sin verificación de email, una respuesta uniforme no lo evita (bastaría
-      con intentar el login) y empeora la UX; lo mitigan el límite de registro
-      por IP y que el bloqueo de cuenta ya no se puede usar contra el titular.
+    - Con EMAIL_VERIFICATION=off (por defecto) el registro responde 409
+      email_taken si el email existe (enumeración): sin correo no se puede
+      avisar al dueño real y una respuesta uniforme empeoraría la UX sin
+      ganar seguridad (bastaría con intentar el login). Con optional/required
+      el registro responde 202 idéntico para cualquier email (cerrado).
+    - Correo "al menos una vez": si el worker cae entre la aceptación del
+      proveedor y el registro del envío, un reintento puede duplicar un correo
+      (los dos enlaces valen: hasta 3 vigentes por cuenta y propósito).
+    - Quien controla el buzón del usuario controla la cuenta (inherente a la
+      recuperación por email). La protección del token en el frontend
+      (fragmento, Referrer-Policy, sin scripts de terceros) depende del cliente.
     - /logout revoca solo el refresh token; el access token vive hasta que
       caduca (ACCESS_TOKEN_EXPIRE_MINUTES). /logout-all, el cambio de
       contraseña o de rol y la detección de robo sí lo invalidan al instante.
@@ -559,7 +613,10 @@ partir de una línea de comandos o de un fichero YAML.
   despliegue (Docker paso a paso con SECRET_KEY, POSTGRES_PASSWORD y
   ALLOWED_HOSTS) y el desarrollo local. Los errores propios de los hooks
   (APIError(..., code="...")) y los mensajes de TaskError se extraen del
-  código, así que se conservan al regenerar. El idioma y la URL base quedan
+  código, así que se conservan al regenerar. Si la API tiene verificación de
+  email o recuperación de contraseña (en .env.example o en el .env), añade la
+  sección "Correos de cuenta": flujos, formato del enlace, qué debe hacer el
+  frontend, errores y la configuración de correo (SPF/DKIM/DMARC). El idioma y la URL base quedan
   en el marcador <!-- apigen:docs:start lang=.. base_url=.. --> y se reutilizan
   si no pasas las opciones. Solo se regenera lo que está entre los
   marcadores; tu introducción y el contacto se conservan.
@@ -582,3 +639,127 @@ partir de una línea de comandos o de un fichero YAML.
   Incluye registro, login de solo lectura (scope=read), refresh, logout,
   logout-all, jobs y health. Verificada con newman contra la API real. Los
   proyectos nuevos la incluyen y apigen docs la menciona en el README del cliente.
+
+  Carpeta Account (recuperación, verificación y cambio de email): copia el token
+  del enlace del correo (lo que va tras #token=) en las variables resetToken o
+  verifyToken. En local sale en el log de la API (EMAIL_BACKEND=console) o en
+  Mailpit (make mail); con EMAIL_BACKEND=file, en el .txt. Las variables se leen
+  con pm.variables.get (valen en la colección o en un Environment) y newPassword
+  trae un valor de ejemplo. Sin token, esas peticiones comprueban el rechazo
+  (400/422). "Reset password" guarda newPassword como password (en el ámbito
+  donde esté). Con newman: --env-var resetToken=... --env-var verifyToken=...
+  Para newman, ejecuta por partes: --folder Register --folder Login
+  --folder Account (la carpeta Auth termina con logout-all).
+
+
+--------------------------------------------------------------------------------
+15. CORREO, VERIFICACIÓN DE EMAIL Y RECUPERACIÓN DE CONTRASEÑA
+--------------------------------------------------------------------------------
+
+  Todo desactivado por defecto (EMAIL_VERIFICATION=off, PASSWORD_RESET=off):
+  una API ya entregada se comporta igual. Se activa por cliente en su .env;
+  nada del correo, dominio ni marca del freelancer queda en el código.
+
+  Configurar un cliente (5-6 variables en .env):
+    EMAIL_VERIFICATION=required        off | optional | required
+    PASSWORD_RESET=on
+    FRONTEND_URL=https://app.cliente.example   los enlaces van SOLO aquí
+    EMAIL_BACKEND=smtp
+    EMAIL_FROM=no-reply@...            dominio del CLIENTE (SPF, DKIM, DMARC)
+    SMTP_HOST / SMTP_PORT / SMTP_SECURITY / SMTP_USER / SMTP_PASSWORD
+    Marca: MAIL_BRAND_NAME, MAIL_BRAND_LOGO_URL, MAIL_BRAND_COLOR,
+    MAIL_SUPPORT_EMAIL, MAIL_FOOTER; idioma: MAIL_DEFAULT_LANGUAGE, MAIL_LANGUAGES.
+  `make new-api NAME=x` acepta --email-verification, --password-reset y
+  --frontend-url: la configuración NO secreta (modos, idioma, marca y
+  FRONTEND_URL) va a .env.example (versionado, lo recibe el cliente) y al .env;
+  remitente y credenciales nunca. `apigen docs` avisa si .env y .env.example no
+  coinciden en esos modos. En producción la app y el
+  worker NO arrancan si falta el backend o es console/file/memory, si
+  EMAIL_FROM falta o es de un dominio de ejemplo, si FRONTEND_URL no es https,
+  si una ruta EMAIL_LINK_* no lleva {token} exactamente una vez o si el SMTP
+  va sin TLS hacia fuera de localhost.
+
+  Desarrollo:
+    - Por defecto EMAIL_BACKEND=console: el correo (con el enlace en su línea)
+      sale en el log de la API, y EMAIL_DELIVERY=inline lo envía la propia
+      API tras responder (no hace falta el worker).
+    - EMAIL_BACKEND=file: .eml, .html y .txt en EMAIL_FILE_DIR (var/mail/).
+      Copia los tokens del .txt o del .html: el .eml usa quoted-printable y
+      parte las líneas largas.
+    - `make mail` levanta Mailpit (compose.mail.yml): bandeja en
+      http://localhost:8025 y en .env EMAIL_BACKEND=smtp SMTP_HOST=localhost
+      SMTP_PORT=1025 SMTP_SECURITY=none.
+
+  Cómo funciona (seguridad):
+    - La API solo ENCOLA un trabajo de sistema (tabla jobs, owner_id vacío):
+      forgot/resend responden 202 con el mismo cuerpo y en el mismo tiempo
+      exista o no la cuenta. El worker busca la cuenta, aplica el cupo por
+      cuenta (60 s entre correos, 3/hora y 10/día, sea cual sea la IP), genera
+      el token y envía. El payload del trabajo se vacía al terminar.
+    - Tokens opacos de 256 bits con prefijo por propósito (pr_ reset, ev_
+      verificación, ec_ cambio de email), solo su SHA-256 en la tabla
+      account_tokens, un solo uso con consumo atómico, caducidad (30 min, 48 h,
+      60 min) y ligados al email y a la contraseña vigentes.
+    - Enlaces: FRONTEND_URL + EMAIL_LINK_RESET / EMAIL_LINK_VERIFY (por defecto
+      "/reset-password#token={token}": el fragmento no llega a ningún
+      servidor). Nunca desde Host/X-Forwarded-Host. La API solo consume
+      tokens por POST (los escáneres de correo abren los enlaces con GET).
+    - Reset: cierra todas las sesiones, desbloquea la cuenta, marca el email
+      como verificado y envía un aviso de "contraseña cambiada". El cambio
+      de contraseña normal también invalida los resets pendientes y avisa.
+    - Registro con verificación: 202 idéntico para email nuevo o existente;
+      el dueño de uno existente recibe "ya tienes cuenta" y su cuenta no cambia.
+    - Cambio de email (POST /users/me/email con la contraseña actual): enlace
+      a la dirección nueva, aviso a la antigua al pedirlo y al completarlo;
+      al confirmar se cierran las sesiones y se invalidan los tokens.
+    - Solo el worker recibe las credenciales SMTP (compose se las quita a la
+      API); smtplib con TLS verificado y STARTTLS obligatorio con `starttls`.
+    - Logs y auditoría sin tokens, enlaces, cuerpos, credenciales ni emails
+      completos. Eventos: auth.password_reset.*, auth.email_verification.*,
+      auth.email_change.*, auth.login.unverified, email.suppressed (motivo),
+      email.send.failed.
+    - Cupos: por cuenta (60 s / 3 por hora / 10 al día para forgot, resend y
+      registro repetido; lo mismo para los enlaces de cambio de email), avisos
+      de seguridad (EMAIL_NOTICES_PER_ACCOUNT_PER_HOUR) y enlaces de cambio de
+      email a una misma dirección (EMAIL_PER_ADDRESS_PER_HOUR). Se serializan
+      por cuenta: varios trabajos a la vez no los multiplican. En development
+      son más holgados y lo descartado se avisa en el log.
+    - Cortacircuitos global con dos presupuestos: EMAIL_MAX_PER_HOUR/DAY (altas,
+      "ya tienes cuenta", cambios de email, correos propios) y
+      EMAIL_MAX_SECURITY_PER_HOUR/DAY (reset y avisos): una inundación de altas
+      no bloquea los resets.
+    - Un error de configuración nunca imprime los valores del .env (secretos).
+    - Los usuarios que ya existían quedan verificados en la migración;
+      createsuperuser y las altas de admin nacen verificados. Si activas
+      required más tarde, los registrados con off no lo están: `apigen users
+      verify --all-existing [--before AAAA-MM-DD]` (auditado) y `apigen check`
+      avisa de cuántos quedan. No hay endpoint de API para esto (REQ-F25).
+    - Idioma: el de Accept-Language de cada petición y, si no viene, el guardado
+      en users.locale (al registrarse o al usar un enlace); si no, el de
+      MAIL_DEFAULT_LANGUAGE.
+
+  Plantillas: de serie en app/email/templates/<lang>/ (es y en; asunto, texto
+  y HTML). Las de email_templates/ ganan fichero a fichero (apigen nunca las
+  toca): `apigen email eject` las copia, `apigen email preview` las muestra y
+  `apigen check` las renderiza todas (una variable inexistente es un error).
+  Jinja2 en sandbox con autoescape en HTML.
+
+  Correos propios desde un hook (en una tarea: `async with ctx.session() as s`):
+    from app.email import send_email
+    await send_email(ctx.session, to=[cliente.email], template="pedido_enviado",
+                     context={"codigo": pedido.codigo})   # sale si hay commit
+  (plantilla en email_templates/<lang>/pedido_enviado.subject.txt/.txt/.html).
+  En hooks/endpoints propios, la dependencia `VerifiedUser`
+  (app.api.deps) exige email verificado cuando EMAIL_VERIFICATION no es off.
+
+  Tests sin correos reales: la fixture `mail` activa los flujos con el backend
+  memory; `process_pending()` ejecuta los trabajos y `mail` es la lista de
+  mensajes "enviados".
+
+  Proveedores: cualquiera con SMTP (SES, Brevo, Mailgun, SendGrid, Postmark,
+  Resend, Zoho, Microsoft 365). Si el hosting bloquea 587/465, usa el 2525 del
+  proveedor. `apigen email test destino@...` traduce los errores (credenciales,
+  TLS, puerto, remitente no verificado). Otro proveedor por API HTTP:
+  EMAIL_BACKEND=custom con EMAIL_BACKEND_CLASS=app.<módulo>:<Clase> (una clase
+  con `async def send(message)`).
+

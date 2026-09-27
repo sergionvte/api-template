@@ -4,7 +4,16 @@ import logging
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from sqlalchemy import func
 from sqlmodel import col, select
 
@@ -17,8 +26,11 @@ from app.core.rate_limit import client_ip, limiter
 from app.core.security import hash_password, password_problems, verify_password
 from app.crud.base import Repository
 from app.db.types import utcnow
+from app.email import enqueue_account_email, request_language
+from app.models.account_token import TokenPurpose
 from app.models.user import User
-from app.schemas.common import Page
+from app.schemas.account import EmailChangeRequest
+from app.schemas.common import Message, Page
 from app.schemas.user import (
     PasswordChange,
     UserAdminCreate,
@@ -27,6 +39,7 @@ from app.schemas.user import (
     UserRead,
     UserUpdateMe,
 )
+from app.services import account_tokens
 from app.services import auth as auth_service
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -34,6 +47,9 @@ repo = Repository(
     User, search_fields=("email", "full_name"), ordering_fields=("email", "created_at")
 )
 
+EMAIL_CHANGE_ACCEPTED = Message(
+    detail="If the address is available, we have sent a confirmation link to it"
+)
 LAST_ADMIN = APIError(status.HTTP_409_CONFLICT, "Cannot remove the last admin", code="last_admin")
 
 ReadMe = Annotated[Principal, Depends(require(Access.user, Scope.read))]
@@ -59,6 +75,7 @@ async def change_password(
     principal: WriteMe,
     payload: PasswordChange,
     session: SessionDep,
+    background: BackgroundTasks,
 ) -> None:
     """Cambia la contraseña y cierra todas las sesiones (hay que volver a hacer login)."""
     user = principal.user
@@ -81,9 +98,73 @@ async def change_password(
     user.hashed_password = await hash_password(payload.new_password)
     user.password_changed_at = utcnow()
     session.add(user)
+    # Los enlaces de recuperación pendientes dejan de valer (REQ-T08).
+    await account_tokens.invalidate(session, user.id, (TokenPurpose.password_reset,))
     await session.commit()
     await auth_service.revoke_all_sessions(session, user)
+    if settings.email_enabled:
+        await enqueue_account_email(
+            session,
+            "auth.notice",
+            {
+                "user_id": str(user.id),
+                "kind": "password_changed",
+                "lang": request_language(request),
+            },
+            background,
+        )
     audit("auth.password.change", user_id=user.id, client_ip=client_ip(request))
+
+
+@router.post(
+    "/me/email",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=Message,
+    include_in_schema=settings.account_emails_enabled,
+)
+@limiter.limit(settings.RATE_LIMIT_LOGIN)
+async def change_email(
+    request: Request,
+    response: Response,
+    principal: WriteMe,
+    payload: EmailChangeRequest,
+    session: SessionDep,
+    background: BackgroundTasks,
+) -> Message:
+    """Pide cambiar el email. No cambia nada hasta que se confirme con el enlace que llega
+    a la dirección NUEVA (`POST /auth/email/verify`); la antigua recibe un aviso.
+
+    Responde 202 igual aunque la dirección nueva ya esté en uso (no revela cuentas).
+    Al confirmarse se cierran todas las sesiones."""
+    if not settings.account_emails_enabled:
+        raise APIError(
+            status.HTTP_403_FORBIDDEN,
+            "Changing the email requires email delivery (EMAIL_VERIFICATION or PASSWORD_RESET)",
+            code="email_change_disabled",
+        )
+    user = principal.user
+    assert user is not None
+    await session.commit()  # libera la conexión mientras se calcula Argon2
+    valid, _ = await verify_password(payload.current_password, user.hashed_password)
+    if not valid:
+        audit("auth.email_change.wrong_password", user_id=user.id, client_ip=client_ip(request))
+        raise APIError(
+            status.HTTP_400_BAD_REQUEST, "Current password is incorrect", code="wrong_password"
+        )
+    if payload.new_email == user.email:
+        raise APIError(status.HTTP_400_BAD_REQUEST, "That is already your email", code="same_email")
+    await enqueue_account_email(
+        session,
+        "auth.email_change",
+        {
+            "user_id": str(user.id),
+            "new_email": payload.new_email,
+            "lang": request_language(request),
+        },
+        background,
+    )
+    audit("auth.email_change.requested", user_id=user.id, client_ip=client_ip(request))
+    return EMAIL_CHANGE_ACCEPTED
 
 
 # --- Administración -------------------------------------------------------------
@@ -120,6 +201,8 @@ async def create_user(payload: UserAdminCreate, admin: AdminPrincipal, session: 
         full_name=payload.full_name,
         role=payload.role,
         hashed_password=await hash_password(payload.password),
+        # Lo da de alta un admin: nace verificado (REQ-F15).
+        email_verified_at=utcnow(),
     )
     session.add(user)
     await session.commit()

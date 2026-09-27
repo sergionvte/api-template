@@ -13,7 +13,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.audit import audit
 from app.core.config import settings
-from app.core.exceptions import APIError
+from app.core.exceptions import EMAIL_NOT_VERIFIED, APIError
 from app.core.permissions import ROLE_SCOPES, Role
 from app.core.security import (
     create_access_token,
@@ -60,7 +60,12 @@ def resolve_scopes(role: Role | str, requested: list[str] | None) -> list[str]:
 # Login y bloqueo de cuenta
 # ---------------------------------------------------------------------------
 async def authenticate(
-    session: AsyncSession, email: str, password: str, *, client_ip: str | None = None
+    session: AsyncSession,
+    email: str,
+    password: str,
+    *,
+    client_ip: str | None = None,
+    require_verified: bool = False,
 ) -> User:
     """Verifica credenciales aplicando "smart lockout".
 
@@ -111,6 +116,11 @@ async def authenticate(
     if not user.is_active:
         audit("auth.login.failure", reason="inactive", user_id=user.id, client_ip=client_ip)
         raise INVALID_CREDENTIALS
+    if require_verified and user.email_verified_at is None:
+        # Solo tras comprobar la contraseña (REQ-F12) y sin tocar last_login_at ni los
+        # contadores: no ha iniciado sesión (UX-76).
+        audit("auth.login.unverified", user_id=user.id, client_ip=client_ip)
+        raise EMAIL_NOT_VERIFIED
 
     values: dict[str, object] = {"last_login_at": now}
     if not locked:
@@ -347,6 +357,10 @@ async def rotate_refresh_token(
     if user is None or not user.is_active:
         await session.commit()
         raise INVALID_REFRESH
+    if settings.email_verification == "required" and user.email_verified_at is None:
+        # Ninguna vía emite tokens a una cuenta sin verificar (REQ-F12).
+        await session.commit()
+        raise INVALID_REFRESH
 
     scopes = resolve_scopes(user.role, scope.split() or None)
     pair, new_row = await issue_tokens(
@@ -449,15 +463,21 @@ async def revoke_by_token(session: AsyncSession, token: str) -> None:
         await revoke_family(session, family_id)
 
 
-async def revoke_all_sessions(session: AsyncSession, user: User) -> None:
-    """Invalida todos los access tokens (token_version) y refresh tokens del usuario."""
+async def revoke_sessions(session: AsyncSession, user_id: uuid.UUID) -> None:
+    """Como revoke_all_sessions pero SIN commit: para hacerlo en la misma transacción
+    que el cambio que lo motiva (reset, cambio de email; Info-1)."""
     await session.execute(
-        update(User).where(col(User.id) == user.id).values(token_version=User.token_version + 1)
+        update(User).where(col(User.id) == user_id).values(token_version=User.token_version + 1)
     )
     await session.execute(
         update(RefreshToken)
-        .where(col(RefreshToken.user_id) == user.id, col(RefreshToken.revoked_at).is_(None))
+        .where(col(RefreshToken.user_id) == user_id, col(RefreshToken.revoked_at).is_(None))
         .values(revoked_at=utcnow())
     )
+
+
+async def revoke_all_sessions(session: AsyncSession, user: User) -> None:
+    """Invalida todos los access tokens (token_version) y refresh tokens del usuario."""
+    await revoke_sessions(session, user.id)
     await session.commit()
     await session.refresh(user)

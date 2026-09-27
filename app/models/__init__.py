@@ -3,6 +3,8 @@
 `apigen` añade automáticamente los modelos nuevos antes del marcador.
 """
 
+from app.models.account_token import AccountToken  # noqa: F401
+from app.models.email_log import EmailLog  # noqa: F401
 from app.models.job import Job  # noqa: F401
 from app.models.refresh_token import RefreshToken  # noqa: F401
 from app.models.user import User  # noqa: F401

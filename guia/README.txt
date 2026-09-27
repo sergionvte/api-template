@@ -198,6 +198,9 @@ escribir `uv run` delante de todo, activa el entorno: `source .venv/bin/activate
 
   Registro:
     POST /api/v1/auth/register   {"email": "...", "password": "...(12+)"}
+    -> 201 con el usuario; con EMAIL_VERIFICATION optional/required, 202
+       {"detail": "Check your inbox to continue"} (igual para cualquier email)
+       y el enlace de verificación llega por correo (sección 17).
 
   Login (formulario OAuth2, no JSON; con JSON responde 415):
     POST /api/v1/auth/login   username=<email>&password=<clave>
@@ -413,6 +416,8 @@ escribir `uv run` delante de todo, activa el entorno: `source .venv/bin/activate
     - `uv run apigen check` antes de desplegar.
     - Rotar la clave: pon la vieja en JWT_PREVIOUS_SECRET_KEYS, la nueva en
       SECRET_KEY, y quita la vieja pasado ACCESS_TOKEN_EXPIRE_MINUTES.
+    - Si hay registro público: EMAIL_VERIFICATION=required y el correo del
+      cliente configurado (sección 17), con SPF/DKIM/DMARC en su dominio.
 
   Revisión de seguridad con agentes (cuando hagas cambios grandes):
     En Claude Code, dentro del repo, pide por ejemplo:
@@ -607,6 +612,10 @@ escribir `uv run` delante de todo, activa el entorno: `source .venv/bin/activate
 --------------------------------------------------------------------------------
 
   1. make new-api NAME=<cliente>-api LANG=es      -> ~/Developer/<cliente>-api
+     Con correo: python3 scripts/new_api.py <cliente>-api --lang es
+       --email-verification required --password-reset --frontend-url https://...
+     (los modos, idioma, marca y FRONTEND_URL van a .env.example, que se entrega;
+     en producción faltará EMAIL_BACKEND=smtp, SMTP_* y EMAIL_FROM en el .env).
   2. En tu Second Brain: nuevo proyecto con la plantilla "Proyecto API para cliente".
   3. Recursos en resources/*.yaml -> uv run apigen generate resources --migrate
   4. Hooks, tareas, tests (uv run pytest) y revisión con los agentes.
@@ -622,3 +631,58 @@ escribir `uv run` delante de todo, activa el entorno: `source .venv/bin/activate
   new_api.py exige la plantilla sin cambios sin commit y copia solo lo
   versionado; antes del commit inicial revisa secretos y datos personales en
   todos los ficheros (si encuentra algo, no hace commit y te lo lista).
+
+
+--------------------------------------------------------------------------------
+17. CORREO: VERIFICACIÓN DE EMAIL Y RECUPERACIÓN DE CONTRASEÑA
+--------------------------------------------------------------------------------
+
+  Apagado por defecto. Para un cliente, en su .env (nunca en el código):
+    EMAIL_VERIFICATION=required     (off | optional | required)
+    PASSWORD_RESET=on
+    FRONTEND_URL=https://app.cliente.example
+    EMAIL_BACKEND=smtp + SMTP_HOST, SMTP_PORT, SMTP_SECURITY, SMTP_USER,
+                  SMTP_PASSWORD
+    EMAIL_FROM=no-reply@<dominio del cliente>   (con SPF, DKIM y DMARC)
+    MAIL_BRAND_NAME / MAIL_BRAND_LOGO_URL / MAIL_BRAND_COLOR / MAIL_SUPPORT_EMAIL
+
+  Probar en local sin proveedor:
+    - Nada que hacer: en development el correo sale en el log de la API
+      (EMAIL_BACKEND=console) y lo envía la propia API (EMAIL_DELIVERY=inline).
+      Copia el token del enlace (lo que va tras #token=).
+    - Para verlo como un correo real: make mail (Mailpit en
+      http://localhost:8025) y en .env EMAIL_BACKEND=smtp SMTP_HOST=localhost
+      SMTP_PORT=1025 SMTP_SECURITY=none.
+    - Antes de entregar: uv run apigen email test tu@example.com (con el SMTP
+      del cliente) y uv run apigen email preview para enseñarle los correos.
+
+  Lo que tiene que hacer el frontend del cliente (va en su README.md):
+    - Página /reset-password: lee el token de location.hash, lo quita con
+      history.replaceState y envía POST /auth/password/reset
+      {"token", "new_password"} (opcional antes: /auth/password/reset/validate).
+    - Página /verify-email: POST /auth/email/verify {"token"} (también confirma
+      los cambios de email). Dos clics = 204.
+    - "¿Olvidaste tu contraseña?": POST /auth/password/forgot {"email"} y
+      mensaje neutro (siempre 202). Reenviar verificación:
+      POST /auth/email/verify/resend. GET /auth/features dice qué está activo.
+
+  Personalizar textos: uv run apigen email eject password_reset --lang es y
+  edita email_templates/es/password_reset.* (asunto, texto y HTML por
+  separado). Correos propios: app.email.send_email(...) con una plantilla en
+  email_templates/. En tests: fixture `mail` + process_pending().
+
+  Límites que conviene conocer (todos configurables): por IP en forgot/resend
+  (RATE_LIMIT_EMAIL_REQUEST) y por cuenta en el worker (60 s entre correos,
+  3/hora, 10/día en producción; en development 0 s, 30/hora y 200/día). Lo
+  excedido se descarta, se audita como email.suppressed y, en development,
+  se avisa en el log ("correo NO enviado: cupo por cuenta").
+
+  ¡Aviso al pasar a EMAIL_VERIFICATION=required! Los usuarios registrados
+  mientras estaba en off no están verificados y recibirán 403 hasta verificar.
+  Si ya eran de confianza:
+    uv run apigen users verify --all-existing --before 2026-10-01
+    uv run apigen users verify --email alguien@example.com
+  (queda en el log de auditoría como admin.user.verify; `apigen check` avisa
+  de cuántos usuarios faltan). Con EMAIL_BACKEND=file, copia el token del
+  .txt (el .eml lo parte).
+  Detalle técnico y de seguridad: README.txt, sección 15.

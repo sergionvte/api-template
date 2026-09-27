@@ -5,6 +5,6 @@ validar los nombres al encolar, y el worker para poder ejecutarlas).
 `apigen` añade automáticamente los módulos de tareas nuevos antes del marcador.
 """
 
-from app.tasks import builtin  # noqa: F401
+from app.tasks import builtin, mail  # noqa: F401
 
 # [apigen:tasks]

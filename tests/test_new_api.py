@@ -115,3 +115,40 @@ def test_real_template_passes_the_scanner():
         pytest.skip("sin repositorio git")
     files = [f for f in module.tracked_files(ROOT) if not f.startswith(module.EXCLUDE)]
     assert module.scan_files(ROOT, files) == []
+
+
+def test_email_flags_go_to_env_example_without_secrets(tmp_path):
+    """UX-67: la configuración NO secreta de correo va también a `.env.example` (lo que
+    recibe el cliente) para que el entregable haga lo que dice su README; credenciales y
+    remitente nunca. Valores con `$` o comillas no se interpolan (Info-5)."""
+    import argparse
+
+    module = _load()
+    project = tmp_path / "p"
+    project.mkdir()
+    shutil.copy(ROOT / ".env.example", project / ".env")
+    shutil.copy(ROOT / ".env.example", project / ".env.example")
+    args = argparse.Namespace(
+        email_verification="required",
+        password_reset=True,
+        frontend_url="https://app.tienda.example",
+        lang="es",
+    )
+    module.configure_email(project, args, "Tienda ${HOME} 'Luna'")
+    for name in (".env", ".env.example"):
+        lines = (project / name).read_text().splitlines()
+        for line in (
+            "EMAIL_VERIFICATION=required",
+            "PASSWORD_RESET=on",
+            "FRONTEND_URL=https://app.tienda.example",
+            "MAIL_DEFAULT_LANGUAGE=es",
+            'MAIL_BRAND_NAME="Tienda {HOME} Luna"',
+            "EMAIL_FROM=",
+            "SMTP_PASSWORD=",
+        ):
+            assert line in lines, (name, line)
+    from dotenv import dotenv_values
+
+    assert dotenv_values(project / ".env.example")["MAIL_BRAND_NAME"] == "Tienda {HOME} Luna"
+    with pytest.raises(SystemExit):
+        module.main(["x-api", "--frontend-url", "javascript:alert(1)", "--no-install"])

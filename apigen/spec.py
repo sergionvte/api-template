@@ -56,7 +56,11 @@ RESERVED_FIELDS = {
     "request",
     "response",
 }
-RESERVED_RESOURCES = {"user", "users", "auth", "health", "refresh_token", "base", "common", "me"}
+RESERVED_RESOURCES = {
+    "user", "users", "auth", "health", "refresh_token", "base", "common", "me",
+    # Flujos de cuenta por correo (endpoints/account.py, models/account_token.py, email_log).
+    "account", "accounts", "account_token", "account_tokens", "email_log", "email_logs",
+}  # fmt: skip
 
 FieldType = Literal[
     "str",

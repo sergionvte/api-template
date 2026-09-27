@@ -3,6 +3,8 @@
 
     python3 scripts/new_api.py cursos-api
     python3 scripts/new_api.py tienda-api --title "Tienda API" --lang es --dir ~/Developer
+    python3 scripts/new_api.py tienda-api --email-verification required --password-reset \
+        --frontend-url https://app.tienda.example
 
 Qué hace:
 1. Exige que la plantilla no tenga cambios sin commit (o `--allow-dirty`) y copia
@@ -12,8 +14,10 @@ Qué hace:
 2. Renombra el proyecto (pyproject, uv.lock, PROJECT_NAME, JWT issuer/audience).
 3. Genera README.md para el cliente (`apigen docs`), un CLAUDE.md y
    `docs/DESARROLLO.txt` (referencia de apigen para desarrollar sin la plantilla).
-4. Instala dependencias, crea `.env` (no versionado), pasa los tests y construye
-   el grafo de graphify (si está instalado).
+4. Instala dependencias, crea `.env` (no versionado) con la configuración de correo
+   pedida (verificación de email, recuperación, FRONTEND_URL, idioma), pasa los tests
+   y construye el grafo de graphify (si está instalado). Los valores reales del
+   cliente solo van al `.env`, nunca a ficheros versionados.
 5. Justo antes del commit inicial revisa TODOS los ficheros de texto que se van a
    versionar: datos personales (rutas de usuario, emails reales) y secretos
    (claves privadas, sk_live_, AWS, tokens...). Si encuentra algo, no hace commit.
@@ -33,6 +37,7 @@ from pathlib import Path
 
 TEMPLATE = Path(__file__).resolve().parent.parent
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,50}$")
+URL_RE = re.compile(r"^https?://[A-Za-z0-9.\-]+(:\d{1,5})?(/[A-Za-z0-9._~\-/]*)?$")
 
 # Prefijos (rutas relativas) que NO van al proyecto nuevo.
 EXCLUDE = (
@@ -51,7 +56,7 @@ EXCLUDE = (
 )
 # Código de recursos generados: si la plantilla los tiene versionados, serían de otro
 # cliente (modelos, hooks, migraciones...). La plantilla solo trae estos.
-BASE_ENDPOINTS = {"__init__.py", "auth.py", "jobs.py", "users.py"}
+BASE_ENDPOINTS = {"__init__.py", "account.py", "auth.py", "jobs.py", "users.py"}
 
 # --- datos personales y secretos -------------------------------------------------
 _EMAIL = re.compile(r"(?<![\w.+:/-])[A-Za-z0-9_.+-]+@(?P<domain>[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)")
@@ -247,8 +252,8 @@ def developer_docs(template: Path) -> str:
         "",
     ]
     wanted = (
-        ("README.txt", "README", (4, 5, 7, 8, 11, 12)),
-        ("guia/README.txt", "guía", (2, 3, 5, 6, 7, 12, 14, 15)),
+        ("README.txt", "README", (4, 5, 7, 8, 11, 12, 15)),
+        ("guia/README.txt", "guía", (2, 3, 5, 6, 7, 12, 14, 15, 17)),
     )
     for rel, label, numbers in wanted:
         source = template / rel
@@ -260,6 +265,46 @@ def developer_docs(template: Path) -> str:
                 title, body = sections[n]
                 parts += ["-" * 80, f"{label} §{n}. {title}", "-" * 80, body]
     return "\n".join(parts)
+
+
+def _env_value(value: str) -> str:
+    """Valor seguro para .env/.env.example: sin saltos de línea, comillas, `\\` ni `$`
+    (python-dotenv interpolaría `${...}`; Info-5), entre comillas si lleva espacios."""
+    clean = re.sub(r"[\r\n'\"\\$]", "", value)
+    return f'"{clean}"' if re.search(r"[\s#]", clean) else clean
+
+
+def configure_email(target: Path, args: argparse.Namespace, title: str) -> None:
+    """Configuración de correo NO secreta del cliente (modos, idioma, marca, FRONTEND_URL)
+    en `.env.example`, que se versiona y recibe el cliente, y en `.env` si ya existe: así
+    el entregable hace lo que dice su README (UX-67). Credenciales y remitente, nunca:
+    solo en el `.env` de cada despliegue."""
+    enabled = args.email_verification != "off" or args.password_reset
+    values = {
+        "EMAIL_VERIFICATION": args.email_verification,
+        "PASSWORD_RESET": "on" if args.password_reset else "off",
+        "MAIL_DEFAULT_LANGUAGE": args.lang,
+        "MAIL_BRAND_NAME": title,
+    }
+    if args.frontend_url:
+        values["FRONTEND_URL"] = args.frontend_url
+    for name in (".env.example", ".env"):
+        env_file = target / name
+        if not env_file.exists():
+            continue
+        text = env_file.read_text(encoding="utf-8")
+        for key, value in values.items():
+            line = f"{key}={_env_value(value)}"
+            text, count = re.subn(rf"^{key}=.*$", lambda _m, line=line: line, text, flags=re.M)
+            if not count:
+                text += f"\n{line}\n"
+        env_file.write_text(text, encoding="utf-8")
+    if enabled:
+        say(
+            f"Correo: verificación={args.email_verification}, recuperación="
+            f"{values['PASSWORD_RESET']} (en .env.example; en desarrollo los correos salen "
+            "en el log)"
+        )
 
 
 def fix_references(target: Path) -> None:
@@ -298,6 +343,10 @@ worker, versiones). README.md es para el cliente (lo genera `apigen docs`).
 - Lógica de negocio: `app/hooks/<recurso>.py` (apigen nunca lo sobrescribe).
 - Procesos pesados: acciones `background: true` en el YAML → `app/tasks/resources/`,
   ejecutadas por `apigen worker` (cola en la tabla `jobs`). En tests: `process_pending()`.
+- Correo (verificación de email, recuperación de contraseña, `app.email.send_email`):
+  configuración SOLO en `.env` (EMAIL_*, SMTP_*, MAIL_*, FRONTEND_URL); plantillas propias
+  en `email_templates/` (`apigen email eject/preview/test`); en local, `make mail` (Mailpit).
+  Tests sin correos reales: fixture `mail` (backend memory) + `process_pending()`.
 - Antes de dar algo por terminado: `uv run pytest` y `uv run ruff check .`.
 - Al terminar (o al cambiar recursos): `uv run apigen docs` regenera README.md para el
   cliente (recuerda el idioma, `{lang}`; los errores `APIError(..., code=...)` de los hooks
@@ -315,6 +364,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--dir", default="~/Developer", help="carpeta padre (defecto ~/Developer)")
     parser.add_argument("--title", help="nombre visible (defecto: a partir del nombre)")
     parser.add_argument("--lang", choices=["en", "es"], default="en", help="idioma del README.md")
+    parser.add_argument(
+        "--email-verification",
+        choices=["off", "optional", "required"],
+        default="off",
+        help="verificación de email al registrarse (defecto off)",
+    )
+    parser.add_argument(
+        "--password-reset", action="store_true", help="activar la recuperación de contraseña"
+    )
+    parser.add_argument(
+        "--frontend-url",
+        help="URL del frontend del cliente para los enlaces de los correos (va al .env)",
+    )
     parser.add_argument("--no-install", action="store_true", help="no ejecutar uv sync ni tests")
     parser.add_argument("--no-git", action="store_true", help="no inicializar el repo git")
     parser.add_argument(
@@ -331,6 +393,8 @@ def main(argv: list[str] | None = None) -> None:
             "nombre inválido: de 2 a 51 caracteres, empieza por letra; minúsculas, números "
             "y guiones (p. ej. 'cursos-api')"
         )
+    if args.frontend_url and not URL_RE.match(args.frontend_url):
+        fail("--frontend-url debe ser una URL http(s):// sin espacios, query ni fragmento")
     target = Path(os.path.expanduser(args.dir)).resolve() / args.name
     if target.exists():
         fail(f"{target} ya existe")
@@ -397,6 +461,7 @@ def main(argv: list[str] | None = None) -> None:
     for rel in ("app/core/config.py", ".env.example"):
         if (target / rel).exists():
             replace_in(target / rel, identity)
+    configure_email(target, args, title)  # antes de init-env: el .env parte de aquí
 
     # 3. Documentación para desarrollar (el cliente recibe README.md)
     (target / "CLAUDE.md").write_text(claude_md(title, args.lang, template), encoding="utf-8")
@@ -413,10 +478,11 @@ def main(argv: list[str] | None = None) -> None:
         python = template / ".venv" / "bin" / "python"
         env = {**os.environ, "PYTHONPATH": str(target)}
         if python.exists():
-            subprocess.run(
-                [str(python), "-m", "apigen.cli", "docs", "--lang", args.lang],
-                cwd=target, env=env, capture_output=True, check=False,
-            )  # fmt: skip
+            for command in (["init-env"], ["docs", "--lang", args.lang]):
+                subprocess.run(
+                    [str(python), "-m", "apigen.cli", *command],
+                    cwd=target, env=env, capture_output=True, check=False,
+                )  # fmt: skip
     else:
         say("Instalando dependencias (uv sync)")
         run([uv, "sync", "-q"], target)

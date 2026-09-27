@@ -64,6 +64,8 @@ class TaskDef:
     payload_model: type[BaseModel] | None = None
     description: str = ""
     takes_ctx: bool = True  # las síncronas pueden declarar solo `payload`
+    # Vaciar el payload al terminar (datos personales como emails: REQ-Q03).
+    scrub_payload: bool = False
 
 
 @dataclass(slots=True)
@@ -93,8 +95,12 @@ def task(
     timeout: float = 300,
     payload_model: type[BaseModel] | None = None,
     description: str = "",
+    scrub_payload: bool = False,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Registra una función como tarea en segundo plano."""
+    """Registra una función como tarea en segundo plano.
+
+    `scrub_payload=True` vacía el payload al terminar (éxito o fallo definitivo): para
+    tareas que reciben datos personales que no deben quedarse JOBS_RETENTION_DAYS."""
     if not _NAME.match(name):
         raise ValueError(f"nombre de tarea inválido: {name!r} (usa p. ej. 'product.export_pdf')")
     if not 1 <= max_attempts <= 20 or not 0 < timeout <= 86_400:
@@ -119,6 +125,7 @@ def task(
             payload_model=payload_model,
             description=description or (func.__doc__ or "").strip().split("\n")[0],
             takes_ctx=takes_ctx,
+            scrub_payload=scrub_payload,
         )
         return func
 

@@ -86,3 +86,7 @@ def setup_logging() -> None:
     for name in ("uvicorn", "uvicorn.error"):
         logging.getLogger(name).handlers[:] = []
         logging.getLogger(name).propagate = True
+    # Con LOG_LEVEL=DEBUG estas librerías vuelcan parámetros SQL (emails) o cabeceras
+    # HTTP: nunca por debajo de WARNING (REQ-G01/G02).
+    for name in ("aiosqlite", "httpx", "httpcore"):
+        logging.getLogger(name).setLevel(max(logging.WARNING, root.level))

@@ -42,6 +42,13 @@ def error_code(exc: Exception, status_code: int) -> str:
     return getattr(exc, "code", None) or DEFAULT_CODES.get(status_code, "error")
 
 
+EMAIL_NOT_VERIFIED = APIError(
+    403,
+    "Email address not verified: check your inbox or ask for a new link",
+    code="email_not_verified",
+)
+
+
 class DatabaseValueError(Exception):
     """Un valor que el esquema aceptó pero el driver de la BD no puede guardar
     (p. ej. OverflowError de sqlite3 con enteros de más de 64 bits). Solo se lanza

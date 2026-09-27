@@ -18,6 +18,7 @@ import json
 import re
 from pathlib import Path
 
+from apigen import docs_accounts
 from apigen.project import load_all_specs, version_info
 from apigen.spec import FieldSpec, ResourceSpec
 
@@ -51,7 +52,7 @@ T = {
             '     -d \'{{"email": "ana@example.com", "password": "a long passphrase"}}\'\n'
             "   ```\n\n"
             '   `201` → `{{"id": "…", "email": "ana@example.com", "full_name": null, "role": "user", '
-            '"is_active": true, "created_at": "…"}}`\n'
+            '"is_active": true, "email_verified": false, "created_at": "…"}}`\n'
             "2. **Log in** (form data, not JSON):\n\n"
             "   ```bash\n"
             "   curl -X POST {base}{p}/auth/login -d 'username=ana@example.com' "
@@ -292,7 +293,7 @@ T["es"] = {
         '     -d \'{{"email": "ana@example.com", "password": "una frase larga"}}\'\n'
         "   ```\n\n"
         '   `201` → `{{"id": "…", "email": "ana@example.com", "full_name": null, "role": "user", '
-        '"is_active": true, "created_at": "…"}}`\n'
+        '"is_active": true, "email_verified": false, "created_at": "…"}}`\n'
         "2. **Login** (formulario, no JSON):\n\n"
         "   ```bash\n"
         "   curl -X POST {base}{p}/auth/login -d 'username=ana@example.com' "
@@ -824,14 +825,18 @@ _POSTMAN = {
         "Import `docs/postman/API.postman_collection.json` into Postman. Set the collection "
         "variables `baseUrl`, `email` and `password` (use *Current value*), run **Auth > Login** "
         "and every other request is sent with `Bearer {{accessToken}}`; the token is refreshed "
-        "automatically before it expires.\n"
+        "automatically before it expires. The **Account** folder covers password reset and email "
+        "verification: paste the token from the email link (after `#token=`) into `resetToken` "
+        "or `verifyToken`.\n"
     ),
     "es": (
         "### Postman\n\n"
         "Importa `docs/postman/API.postman_collection.json` en Postman. Ajusta las variables de la "
         "colección `baseUrl`, `email` y `password` (en *Current value*), ejecuta **Auth > Login** "
         "y el resto de peticiones van con `Bearer {{accessToken}}`; el token se renueva solo "
-        "antes de caducar.\n"
+        "antes de caducar. La carpeta **Account** cubre la recuperación de contraseña y la "
+        "verificación del email: pega el token del enlace del correo (lo que va tras `#token=`) "
+        "en `resetToken` o `verifyToken`.\n"
     ),
 }
 
@@ -854,17 +859,29 @@ def render_docs(base: Path, lang: str = "en", base_url: str = DEFAULT_BASE_URL) 
         "maxo": env.get("MAX_OFFSET", "10000"),
     }
 
+    account = docs_accounts.account_settings(base, env)
+    mode, reset = docs_accounts.modes(account)
+    mail_flows = mode != "off" or reset
+    ta = docs_accounts.T[lang]
+
     parts = [f"<!-- apigen:docs:start lang={lang} base_url={base_url} -->", ""]
-    feats = t["feat_list"] + ([t["feat_jobs"]] if has_jobs else [])
+    feats = (
+        t["feat_list"]
+        + ([ta["feature"]] if mail_flows else [])
+        + ([t["feat_jobs"]] if has_jobs else [])
+    )
     parts.append(f"## {t['features']}\n\n" + "\n".join(f"- {f}" for f in feats) + "\n")
 
     # --- Para integrar (frontend / móvil) -----------------------------------------------
     parts.append(f"## {t['integrate']}\n\n" + t["integrate_body"].format(base=base_url, p=p))
     expires = str(int(access) * 60) if access.isdigit() else "900"
-    parts.append(
-        f"### {t['first_steps']}\n\n"
-        + t["first_steps_body"].format(base=base_url, p=p, expires=expires)
-    )
+    first_steps = t["first_steps_body"].format(base=base_url, p=p, expires=expires)
+    if mode != "off":
+        # Con verificación, el registro responde 202 igual para cualquier email.
+        first_steps = re.sub(
+            r"   `201` → `\{.*?\}`\n", lambda _m: ta["register_202"], first_steps, flags=re.S
+        )
+    parts.append(f"### {t['first_steps']}\n\n" + first_steps)
     parts.append(
         f"### {t['auth']}\n\n"
         + t["auth_body"].format(
@@ -874,7 +891,8 @@ def render_docs(base: Path, lang: str = "en", base_url: str = DEFAULT_BASE_URL) 
     if (base / "docs/postman/API.postman_collection.json").exists():
         parts.append(_POSTMAN[lang])
     parts.append(f"### {t['pagination']}\n\n" + t["pagination_body"].format(**page))
-    err = "\n".join(f"| {a} | `{b}` | {c} |" for a, b, c in t["err_rows"])
+    err_rows = list(t["err_rows"]) + (ta["err_rows"] if mail_flows else [])
+    err = "\n".join(f"| {a} | `{b}` | {c} |" for a, b, c in err_rows)
     parts.append(
         f"### {t['errors']}\n\n{t['errors_body']}\n| HTTP | code | |\n|---|---|---|\n{err}\n"
     )
@@ -886,6 +904,8 @@ def render_docs(base: Path, lang: str = "en", base_url: str = DEFAULT_BASE_URL) 
             f"| HTTP | code | detail |\n|---|---|---|\n{rows}\n"
         )
     parts.append(f"### {t['accounts']}\n\n" + t["accounts_body"].format(p=p))
+    if mail_flows:
+        parts.append(docs_accounts.account_section(account, lang, p))
 
     parts.append(f"### {t['resources']}\n")
     for version in sorted(versions, key=lambda v: int(v[1:]), reverse=True):
@@ -928,8 +948,11 @@ def render_docs(base: Path, lang: str = "en", base_url: str = DEFAULT_BASE_URL) 
     # --- Para desplegar y para desarrollar ------------------------------------------
     parts.append(f"## {t['deploy_title']}\n")
     parts.append(f"### {t['quick']}\n\n{t['quick_body']}")
-    rows = "\n".join(f"| `{k}` | {v} |" for k, v in t["cfg_rows"])
+    cfg_rows = list(t["cfg_rows"]) + (ta["cfg_rows"] if mail_flows else [])
+    rows = "\n".join(f"| `{k}` | {v} |" for k, v in cfg_rows)
     parts.append(f"### {t['config']}\n\n{t['config_body']}\n\n| Variable | |\n|---|---|\n{rows}\n")
+    if mail_flows:
+        parts.append(f"### {ta['deliver_title']}\n\n{ta['deliver_body']}")
     parts.append(f"### {t['deploy']}\n\n{t['deploy_body']}")
     parts.append(
         f"## {t['local']}\n\n"

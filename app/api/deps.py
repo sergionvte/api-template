@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.config import settings
+from app.core.exceptions import EMAIL_NOT_VERIFIED as _EMAIL_NOT_VERIFIED
 from app.core.exceptions import APIError
 from app.core.permissions import ROLE_SCOPES, SCOPE_DESCRIPTIONS, Access, Role, Scope
 from app.core.security import TokenError, TokenExpired, decode_access_token
@@ -221,3 +222,20 @@ _ERROR_DESCRIPTIONS = {
 def error_responses(*codes: int) -> dict[int | str, dict[str, Any]]:
     """Respuestas de error documentadas en OpenAPI para los endpoints generados."""
     return {code: {"model": ErrorBody, "description": _ERROR_DESCRIPTIONS[code]} for code in codes}
+
+
+EMAIL_NOT_VERIFIED = _EMAIL_NOT_VERIFIED  # reexportado (app.core.exceptions)
+
+
+async def verified_user(principal: Annotated[Principal, Depends(require(Access.user))]) -> User:
+    """Usuario autenticado con el email verificado (si EMAIL_VERIFICATION no es `off`).
+
+    Para hooks y endpoints propios en modo `optional`; con `required` los no
+    verificados ni siquiera obtienen tokens."""
+    assert principal.user is not None
+    if settings.email_verification != "off" and principal.user.email_verified_at is None:
+        raise EMAIL_NOT_VERIFIED
+    return principal.user
+
+
+VerifiedUser = Annotated[User, Depends(verified_user)]

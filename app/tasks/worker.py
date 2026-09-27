@@ -173,11 +173,19 @@ async def run_job(job_id: uuid.UUID, worker_id: str | None = None) -> str:
         # La traza va al log (con job_id); al cliente solo un mensaje genérico.
         logger.exception("job failed", extra=extra)
         return await fail("Task failed", retry=True)
-    if not await queue.complete(job.id, result, worker_id=worker_id):
+    if not await queue.complete(job.id, result, worker_id=worker_id, scrub=task.scrub_payload):
         logger.warning("job lease lost: result discarded", extra=extra)
         return "lease_lost"
     logger.info("job succeeded", extra=extra)
     return "succeeded"
+
+
+async def run_now(job_id: uuid.UUID, worker_id: str = "inline") -> str:
+    """Reclama y ejecuta un trabajo concreto ya encolado (envío `inline` en desarrollo).
+    Si un worker se lo llevó antes, no hace nada."""
+    if not await queue.claim(worker_id, 1, job_id=job_id):
+        return "not_claimed"
+    return await run_job(job_id, worker_id)
 
 
 async def process_pending(limit: int = 100, worker_id: str = "inline") -> int:

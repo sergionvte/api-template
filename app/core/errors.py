@@ -32,7 +32,7 @@ def _request_id(request: Request) -> str | None:
 
 
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
-    if "/auth/" in request.url.path:
+    if "/auth/" in request.url.path or request.url.path.endswith("/users/me/email"):
         # Un 429 en login/registro/refresh es señal de fuerza bruta: se audita. El resto
         # de endpoints no, para no convertir un flood en un flood de logs.
         audit(

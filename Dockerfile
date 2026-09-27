@@ -11,6 +11,8 @@ COPY app ./app
 COPY apigen ./apigen
 COPY alembic ./alembic
 COPY alembic.ini ./
+# Plantillas de correo propias del proyecto (las de serie van dentro de app/email/).
+COPY email_templates ./email_templates
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
 
 # ---- runtime: imagen mínima, usuario sin privilegios ------------------------------

@@ -43,7 +43,16 @@ app = typer.Typer(
 version_app = typer.Typer(help="Gestiona versiones de la API (v1, v2...).", no_args_is_help=True)
 db_app = typer.Typer(help="Migraciones de base de datos (Alembic).", no_args_is_help=True)
 app.add_typer(version_app, name="version")
+email_app = typer.Typer(
+    help="Correo: prueba de envío, vista previa y copia de plantillas.", no_args_is_help=True
+)
 app.add_typer(db_app, name="db")
+app.add_typer(email_app, name="email")
+users_app = typer.Typer(
+    help="Operaciones de operador sobre usuarios (quedan en el log de auditoría).",
+    no_args_is_help=True,
+)
+app.add_typer(users_app, name="users")
 
 
 def _fail(message: str) -> None:
@@ -303,6 +312,17 @@ def docs(
         _fail(str(exc))
     verb = "creado" if created else "actualizado"
     typer.secho(f"✓ {path.name} {verb} ({lang})", fg=typer.colors.GREEN)
+    from apigen import docs_accounts
+    from apigen.docs import read_env_example
+
+    base = project.root()
+    differ = docs_accounts.mismatches(base, read_env_example(base))
+    if differ:
+        typer.secho(
+            "  ! El README describe " + ", ".join(differ) + ": copia esos valores a "
+            ".env.example (es lo que recibe el cliente) o el entregable no hará lo que dice.",
+            fg=typer.colors.YELLOW,
+        )
     if created:
         typer.echo("  Completa la introducción y el contacto (fuera de los marcadores).")
 
@@ -556,11 +576,13 @@ def db_prune() -> None:
 async def _prune() -> None:
     from app.core.config import settings
     from app.db.session import SessionFactory, engine
+    from app.services.account_tokens import prune as prune_account_tokens
     from app.services.auth import prune_refresh_tokens
     from app.tasks.queue import prune_jobs
 
     async with SessionFactory() as session:
         removed = await prune_refresh_tokens(session)
+        tokens_removed, logs_removed = await prune_account_tokens(session)
     jobs_removed = await prune_jobs()
     await engine.dispose()
     typer.secho(
@@ -571,6 +593,10 @@ async def _prune() -> None:
     typer.secho(
         f"✓ {removed} refresh tokens borrados (retención: sesiones vivas y "
         f"{settings.LOGIN_FAMILIAR_DAYS} días)",
+        fg=typer.colors.GREEN,
+    )
+    typer.secho(
+        f"✓ {tokens_removed} tokens de cuenta y {logs_removed} registros de envío borrados",
         fg=typer.colors.GREEN,
     )
 
@@ -628,6 +654,13 @@ def init_env(
             "  DATABASE_URL       PostgreSQL, obligatorio (docker compose lo fija por ti)\n"
             "  RATE_LIMIT_STORAGE_URI  redis://... con varios workers (compose lo fija)\n"
             "  ALLOW_REGISTRATION ¿registro abierto al público? (por defecto true)\n"
+            "  Correo (si usas verificación o recuperación de contraseña):\n"
+            "    EMAIL_VERIFICATION / PASSWORD_RESET   off|optional|required / on|off\n"
+            "    EMAIL_BACKEND=smtp, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD\n"
+            "    EMAIL_FROM         remitente del dominio DEL CLIENTE (con SPF, DKIM y DMARC)\n"
+            "    FRONTEND_URL       https://... del frontend (los enlaces van ahí)\n"
+            "    MAIL_BRAND_*, MAIL_SUPPORT_EMAIL, MAIL_DEFAULT_LANGUAGE\n"
+            "  Prueba el envío con: apigen email test tu@example.com\n"
             "Después: apigen check. Programa `apigen db prune` a diario (retención de IPs)."
         )
 
@@ -660,6 +693,7 @@ async def _createsuperuser(email: str, promote: bool) -> None:
     from app.core.permissions import Role
     from app.core.security import hash_password, password_problems
     from app.db.session import SessionFactory, engine
+    from app.db.types import utcnow
     from app.models.user import User
 
     try:
@@ -686,7 +720,12 @@ async def _createsuperuser(email: str, promote: bool) -> None:
             problems = password_problems(password, email, lang="es")
             if problems:
                 _fail("Contraseña débil: " + "; ".join(problems))
-            user = User(email=email, hashed_password=await hash_password(password), role=Role.admin)
+            user = User(
+                email=email,
+                hashed_password=await hash_password(password),
+                role=Role.admin,
+                email_verified_at=utcnow(),  # nace verificado (REQ-F13)
+            )
         session.add(user)
         await session.commit()
     await engine.dispose()
@@ -741,11 +780,174 @@ def check() -> None:
             warn if s.is_production and not s.TRUSTED_PROXIES else ok,
         ),
         ("Registro abierto", str(s.ALLOW_REGISTRATION), ok),
+        *_email_rows(s, ok, warn),
     ]
     for label, value, color in rows:
         typer.echo(f"  {label:<22}", nl=False)
         typer.secho(value, fg=color)
+    worker_problems = _worker_problems()
+    if worker_problems:
+        _fail("Configuración del worker (el que envía los correos):\n  " + worker_problems)
+    unverified = _unverified_warning(s)
+    if unverified:
+        typer.secho(f"  ! {unverified}", fg=warn)
+    from app.email.render import check_templates
+
+    errors, warnings = check_templates()
+    for message in warnings:
+        typer.secho(f"  ! plantillas: {message}", fg=warn)
+    if errors:
+        _fail("Plantillas de correo con errores:\n  " + "\n  ".join(errors))
     typer.secho("✓ Configuración válida", fg=ok)
+
+
+def _worker_problems() -> str:
+    """`check` valida también las reglas del rol worker (SMTP_HOST, TLS...): si no, el
+    fallo aparecería al desplegar el worker (UX-73)."""
+    from app.core.config import Settings
+
+    try:
+        Settings(PROCESS_ROLE="worker")
+    except ValidationError as exc:
+        return _clean(exc).replace("Configuración insegura:\n  - ", "").replace("\n  - ", "\n  ")
+    return ""
+
+
+def _unverified_warning(s) -> str:
+    """Con EMAIL_VERIFICATION=required, avisa si hay usuarios sin verificar (UX-68)."""
+    if s.email_verification != "required":
+        return ""
+    try:
+        count = asyncio.run(_count_unverified())
+    except Exception:  # noqa: BLE001  (sin BD accesible no se avisa)
+        return ""
+    if not count:
+        return ""
+    return (
+        f"{count} usuario(s) sin verificar no podrán iniciar sesión con "
+        "EMAIL_VERIFICATION=required hasta verificar su email. Si ya eran de confianza: "
+        "apigen users verify --all-existing [--before AAAA-MM-DD]"
+    )
+
+
+async def _count_unverified() -> int:
+    from sqlalchemy import func
+    from sqlmodel import col, select
+
+    from app.db.session import SessionFactory, engine
+    from app.models.user import User
+
+    try:
+        async with SessionFactory() as session:
+            query = select(func.count()).where(col(User.email_verified_at).is_(None))
+            return (await session.exec(query)).one()
+    finally:
+        await engine.dispose()
+
+
+@users_app.command("verify")
+def users_verify(
+    email: Annotated[str | None, typer.Option(help="Marcar un usuario concreto")] = None,
+    all_existing: Annotated[
+        bool, typer.Option("--all-existing", help="Marcar todos los que aún no lo están")
+    ] = False,
+    before: Annotated[
+        str | None, typer.Option(help="Con --all-existing: solo los creados antes (AAAA-MM-DD)")
+    ] = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="No pedir confirmación")] = False,
+) -> None:
+    """Marca emails como verificados (p. ej. al pasar de off/optional a required).
+
+    Es un comando de operador (no hay endpoint de API para esto, REQ-F25) y queda en
+    el log de auditoría (`admin.user.verify`)."""
+    if bool(email) == all_existing:
+        _fail("Indica --email o --all-existing (uno de los dos)")
+    if before and not all_existing:
+        _fail("--before solo se usa con --all-existing")
+    cutoff = None
+    if before:
+        try:
+            cutoff = date.fromisoformat(before)
+        except ValueError:
+            _fail("--before debe ser una fecha AAAA-MM-DD")
+    _load_app_settings()
+    target = email.strip().lower() if email else None
+    if all_existing and not yes:
+        scope = f"creados antes del {cutoff}" if cutoff else "todos los que faltan"
+        typer.confirm(f"¿Marcar como verificados los usuarios sin verificar ({scope})?", abort=True)
+    count = asyncio.run(_users_verify(target, cutoff))
+    if target and not count:
+        _fail(f"No hay ningún usuario sin verificar con el email {target}")
+    typer.secho(f"✓ {count} usuario(s) marcados como verificados", fg=typer.colors.GREEN)
+
+
+async def _users_verify(email: str | None, cutoff: date | None) -> int:
+    from datetime import UTC, datetime
+
+    from sqlalchemy import update
+    from sqlmodel import col
+
+    from app.core.audit import audit
+    from app.core.logging import setup_logging
+    from app.db.session import SessionFactory, engine
+    from app.db.types import utcnow
+    from app.models.user import User
+
+    setup_logging()
+    query = update(User).where(col(User.email_verified_at).is_(None))
+    if email:
+        query = query.where(col(User.email) == email)
+    if cutoff:
+        query = query.where(
+            col(User.created_at) < datetime(cutoff.year, cutoff.month, cutoff.day, tzinfo=UTC)
+        )
+    try:
+        async with SessionFactory() as session:
+            result = await session.execute(query.values(email_verified_at=utcnow()))
+            await session.commit()
+    finally:
+        await engine.dispose()
+    audit(
+        "admin.user.verify",
+        actor="cli",
+        scope="email" if email else "all_existing",
+        before=cutoff.isoformat() if cutoff else None,
+        count=result.rowcount,
+    )
+    return result.rowcount or 0
+
+
+def _email_rows(s, ok: str, warn: str) -> list[tuple[str, str, str]]:
+    """Filas de correo de `apigen check` (sin credenciales)."""
+    from urllib.parse import urlsplit
+
+    backend = s.email_backend or "(sin configurar)"
+    detail = backend
+    if backend == "smtp":
+        detail = f"smtp ({s.SMTP_HOST or '?'}:{s.SMTP_PORT}, {s.SMTP_SECURITY.upper()})"
+    elif backend == "file":
+        detail = f"file ({s.EMAIL_FILE_DIR})"
+    dev_backend = backend in {"console", "file", "memory", "(sin configurar)"}
+    sender = f'"{s.EMAIL_FROM_NAME or s.mail_brand_name}" <{s.EMAIL_FROM}>' if s.EMAIL_FROM else "-"
+    front = urlsplit(s.FRONTEND_URL) if s.FRONTEND_URL else None
+    in_cors = front is not None and f"{front.scheme}://{front.netloc}" in s.CORS_ORIGINS
+    if front is not None and not s.CORS_ORIGINS and s.ENVIRONMENT == "development":
+        # En desarrollo, sin CORS_ORIGINS, se permite cualquier localhost (UX-74).
+        in_cors = (front.hostname or "") in {"localhost", "127.0.0.1", "::1"}
+    rows = [
+        ("Correo", f"{detail} (envío: {s.email_delivery})", warn if dev_backend else ok),
+        ("Remitente", sender, ok),
+        ("Verificación email", s.email_verification, ok),
+        ("Recuperar contraseña", "on" if s.password_reset_enabled else "off", ok),
+        (
+            "Frontend (enlaces)",
+            (s.FRONTEND_URL or "-") + ("" if in_cors or not front else "  (no está en CORS)"),
+            ok if in_cors or not front else warn,
+        ),
+    ]
+    if s.email_verification == "required" and not s.ALLOW_REGISTRATION:
+        rows.append(("", "verificación required con ALLOW_REGISTRATION=false", warn))
+    return rows
 
 
 @app.command()
@@ -799,6 +1001,166 @@ def serve(
             "20",
         ]
     )
+
+
+# ---------------------------------------------------------------------------
+# Correo
+# ---------------------------------------------------------------------------
+_EMAIL_HINTS = {
+    "smtp_auth_failed": "autenticación SMTP rechazada: revisa SMTP_USER y SMTP_PASSWORD "
+    "(algunos proveedores usan 'apikey' como usuario)",
+    "smtp_connection": "no se pudo conectar a {host}:{port} (timeout o conexión rechazada): "
+    "revisa SMTP_HOST/SMTP_PORT y que tu hosting permita salir por ese puerto "
+    "(si bloquea 587/465, prueba el 2525 de tu proveedor)",
+    "smtp_tls_error": "falló el TLS: el puerto 465 requiere SMTP_SECURITY=ssl y el 587, starttls",
+    "smtp_tls_certificate": "el certificado del servidor no es válido para {host}: usa el host "
+    "exacto que indica tu proveedor",
+    "smtp_starttls_unavailable": "el servidor no ofrece STARTTLS: usa SMTP_SECURITY=ssl "
+    "(puerto 465); `none` solo para Mailpit en local",
+    "smtp_recipient_refused": "el servidor rechazó el destinatario (¿dirección válida? "
+    "¿remitente verificado en el proveedor?)",
+    "smtp_not_configured": "falta SMTP_HOST",
+    "smtp_host_not_found": "no se encuentra el servidor {host}: revisa SMTP_HOST",
+    "email_disabled": "no hay backend de correo (EMAIL_BACKEND vacío en producción o disabled)",
+}
+
+
+def _email_hint(code: str, s) -> str:
+    if code in _EMAIL_HINTS:
+        return _EMAIL_HINTS[code].format(host=s.SMTP_HOST, port=s.SMTP_PORT)
+    if code.startswith("smtp_5"):
+        return (
+            f"el servidor rechazó el mensaje ({code[5:]}): suele ser un remitente (EMAIL_FROM) "
+            "o dominio no verificado en tu proveedor"
+        )
+    if code.startswith("smtp_4"):
+        return f"rechazo temporal del servidor ({code[5:]}): inténtalo más tarde"
+    return code
+
+
+def _load_app_settings():
+    os.chdir(project.root())
+    sys.path.insert(0, str(Path.cwd()))
+    try:
+        from app.core.config import settings as s
+    except Exception as exc:  # noqa: BLE001
+        _fail(_clean(exc))
+    return s
+
+
+@email_app.command("test")
+def email_test(
+    to: Annotated[str, typer.Argument(help="Destinatario de la prueba")],
+    template: Annotated[str, typer.Option(help="Plantilla a enviar")] = "test",
+    lang: Annotated[str | None, typer.Option(help="Idioma (defecto MAIL_DEFAULT_LANGUAGE)")] = None,
+) -> None:
+    """Envía YA un correo de prueba (sin la cola) con la configuración actual."""
+    s = _load_app_settings()
+    from pydantic import EmailStr, TypeAdapter
+
+    try:
+        TypeAdapter(EmailStr).validate_python(to)
+    except ValidationError:
+        _fail(f"{to!r} no es una dirección de correo válida")
+    asyncio.run(_email_test(s, to, template, lang))
+
+
+async def _email_test(s, to: str, template: str, lang: str | None) -> None:
+    from app.email.backends import EmailError, get_backend
+    from app.email.message import EmailMessage
+    from app.email.render import TemplateError, render, resolve_language, sample_context
+
+    backend = get_backend()
+    if backend.name == "smtp" and s.SMTP_PORT == 465 and s.SMTP_SECURITY == "starttls":
+        # Se sabe antes de conectar y esperar al timeout (UX-72).
+        _fail("smtp: el puerto 465 usa TLS directo: pon SMTP_SECURITY=ssl (o usa el 587)")
+    language = resolve_language(lang)
+    try:
+        rendered = render(template, language, sample_context(template, language))
+        await backend.send(
+            EmailMessage(to=(to,), subject=rendered.subject, text=rendered.text, html=rendered.html)
+        )
+    except TemplateError as exc:
+        _fail(f"plantilla: {exc}")
+    except EmailError as exc:
+        _fail(f"{backend.name}: {_email_hint(exc.code, s)}")
+    except ValueError:
+        _fail("cabecera no válida: revisa EMAIL_FROM, EMAIL_FROM_NAME y EMAIL_REPLY_TO")
+    if backend.name in {"console", "memory"}:
+        typer.secho(
+            f"✓ Con EMAIL_BACKEND={backend.name} no sale ningún correo: mira el log", fg="yellow"
+        )
+    elif backend.name == "file":
+        path = getattr(backend, "last_path", None) or s.EMAIL_FILE_DIR
+        typer.secho(f"✓ Guardado en {path} (y el .eml y .html al lado)", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"✓ Enviado a {to} con {backend.name}", fg=typer.colors.GREEN)
+
+
+@email_app.command("preview")
+def email_preview(
+    template: Annotated[str | None, typer.Argument(help="Plantilla (defecto: todas)")] = None,
+    lang: Annotated[str | None, typer.Option(help="Idioma (defecto: todos)")] = None,
+    out: Annotated[Path, typer.Option(help="Carpeta de salida")] = Path("var/mail/preview"),
+) -> None:
+    """Genera el HTML y el texto de las plantillas con datos de ejemplo."""
+    s = _load_app_settings()
+    from app.email.render import BUILTIN, TemplateError, render, sample_context
+
+    names = [template] if template else list(BUILTIN)
+    languages = [lang] if lang else s.MAIL_LANGUAGES
+    out.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        for language in languages:
+            try:
+                rendered = render(name, language, sample_context(name, language))
+            except TemplateError as exc:
+                _fail(str(exc))
+            stem = out / f"{name}.{rendered.language}"
+            Path(f"{stem}.txt").write_text(
+                f"Subject: {rendered.subject}\n\n{rendered.text}", encoding="utf-8"
+            )
+            if rendered.html:
+                Path(f"{stem}.html").write_text(rendered.html, encoding="utf-8")
+            typer.echo(f"  {stem}.html / .txt")
+    typer.secho(f"✓ Vista previa en {out}/ (ábrela en el navegador)", fg=typer.colors.GREEN)
+
+
+@email_app.command("eject")
+def email_eject(
+    template: Annotated[
+        str | None, typer.Argument(help="Plantilla o 'layout' (defecto: todas)")
+    ] = None,
+    lang: Annotated[str | None, typer.Option(help="Idioma (defecto: todos los de serie)")] = None,
+    force: Annotated[bool, typer.Option(help="Sobrescribir las que ya existan")] = False,
+) -> None:
+    """Copia plantillas de serie a EMAIL_TEMPLATES_DIR para personalizarlas."""
+    import shutil
+
+    _load_app_settings()
+    from app.email.render import BUILTIN, BUILTIN_DIR, templates_dir
+
+    target = templates_dir()
+    files: list[Path] = []
+    if template in (None, "layout"):
+        files += [BUILTIN_DIR / n for n in ("_layout.html", "_button.html", "_footer.txt")]
+    if template != "layout":
+        if template is not None and template not in BUILTIN:
+            _fail(f"plantilla desconocida: {template} (de serie: {', '.join(BUILTIN)})")
+        for folder in sorted(p for p in BUILTIN_DIR.iterdir() if p.is_dir()):
+            if lang and folder.name != lang:
+                continue
+            for name in [template] if template else BUILTIN:
+                files += sorted(folder.glob(f"{name}.*"))
+    for src in files:
+        dst = target / src.relative_to(BUILTIN_DIR)
+        if dst.exists() and not force:
+            typer.echo(f"  = {dst} (ya existe)")
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        typer.echo(f"  + {dst}")
+    typer.secho(f"✓ Edita las copias en {target}/ (ganan a las de serie)", fg=typer.colors.GREEN)
 
 
 def _uvicorn(args: list[str]) -> None:

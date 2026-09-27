@@ -1,0 +1,22 @@
+# Mailpit para DESARROLLO: captura todo el correo; nada sale a Internet.
+#   make mail   (o: docker compose -f compose.mail.yml up -d)
+#   Bandeja web: http://localhost:8025      SMTP: localhost:1025 (sin TLS ni usuario)
+# En el .env de desarrollo:
+#   EMAIL_BACKEND=smtp
+#   SMTP_HOST=localhost
+#   SMTP_PORT=1025
+#   SMTP_SECURITY=none
+# (SMTP_SECURITY=none solo se admite hacia localhost en producción: esto es para local.)
+# Ojo: la bandeja web no pide contraseña y muestra los enlaces con token; por eso los
+# puertos solo escuchan en 127.0.0.1. Nunca lo expongas ni lo uses en producción.
+services:
+  mailpit:
+    image: axllent/mailpit:v1.27
+    ports:
+      - "127.0.0.1:8025:8025"
+      - "127.0.0.1:1025:1025"
+    environment:
+      MP_MAX_MESSAGES: 500
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+    restart: unless-stopped

@@ -53,10 +53,12 @@ class UserRead(BaseModel):
     full_name: str | None
     role: Role
     is_active: bool
+    email_verified: bool
     created_at: datetime
 
 
 class UserAdminRead(UserRead):
+    email_verified_at: datetime | None
     failed_login_attempts: int
     locked_until: datetime | None
     last_login_at: datetime | None

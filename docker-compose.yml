@@ -21,6 +21,11 @@ services:
       # fija en `backend` (ipv4_address) y pon esa IP aquí. Nunca un rango amplio
       # (SEC-21/22). El proxy debe SOBRESCRIBIR X-Forwarded-For, no añadir.
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.30.57.1}
+      # Mínimo privilegio (REQ-C10): la API solo ENCOLA los correos; quien envía es el
+      # worker, el único que recibe las credenciales SMTP.
+      SMTP_USER: ""
+      SMTP_PASSWORD: ""
+      SMTP_PASSWORD_FILE: ""
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -48,6 +53,8 @@ services:
       SECRET_KEY: ""
       JWT_PREVIOUS_SECRET_KEYS: ""
       JOBS_HEARTBEAT_FILE: /tmp/apigen-worker.heartbeat
+      # El worker envía los correos (SMTP_* del .env) y construye los enlaces con
+      # FRONTEND_URL: nunca con la cabecera Host de una petición.
     # El worker no sirve HTTP: en vez del healthcheck de la imagen (/health/live) se
     # comprueba su latido, que solo se escribe mientras la BD responde (SEC-39).
     # Ojo: sin orquestador, "unhealthy" no reinicia el contenedor (solo lo señala).

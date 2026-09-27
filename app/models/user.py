@@ -24,3 +24,11 @@ class User(IDMixin, TimestampMixin, table=True):
     locked_until: datetime | None = Field(default=None, sa_type=UTCDateTime)
     last_login_at: datetime | None = Field(default=None, sa_type=UTCDateTime)
     password_changed_at: datetime | None = Field(default=None, sa_type=UTCDateTime)
+    # None = email sin verificar. La migración marca a los usuarios ya existentes.
+    email_verified_at: datetime | None = Field(default=None, sa_type=UTCDateTime)
+    # Idioma de los correos (de Accept-Language al registrarse o al usar un enlace).
+    locale: str | None = Field(default=None, max_length=10)
+
+    @property
+    def email_verified(self) -> bool:
+        return self.email_verified_at is not None

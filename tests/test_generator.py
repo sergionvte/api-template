@@ -743,3 +743,12 @@ async def test_ordering_parameter_gets_a_hint():
     with pytest.raises(HTTPException) as exc:
         await guard(request)
     assert "use order_by" in exc.value.detail[0]["msg"]
+
+
+@pytest.mark.parametrize("name", ["account", "account_token", "email_log"])
+def test_account_flow_names_are_reserved(name):
+    """Un recurso no puede pisar endpoints/account.py ni los modelos de los tokens."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="reservado"):
+        _spec(name=name)

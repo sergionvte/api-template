@@ -107,6 +107,8 @@ def _prod(**overrides) -> Settings:
         "ALLOWED_HOSTS": ["api.example.com"],
         "DATABASE_URL": "postgresql+asyncpg://u:p@db:5432/api",
         "TRUSTED_PROXIES": ["172.30.57.1"],
+        # Como en un despliegue real: sin backend de correo (conftest fija `memory`).
+        "EMAIL_BACKEND": None,
     }
     values.update(overrides)
     return Settings(**values)

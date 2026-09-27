@@ -100,8 +100,10 @@ async def enqueue(
     return job
 
 
-async def claim(worker_id: str, limit: int) -> list[uuid.UUID]:
-    """Reclama hasta `limit` trabajos listos y los marca como `running`."""
+async def claim(worker_id: str, limit: int, *, job_id: uuid.UUID | None = None) -> list[uuid.UUID]:
+    """Reclama hasta `limit` trabajos listos y los marca como `running`.
+
+    Con `job_id`, solo ese (envío `inline` de correos en desarrollo)."""
     if limit <= 0:
         return []
     now = utcnow()
@@ -112,6 +114,8 @@ async def claim(worker_id: str, limit: int) -> list[uuid.UUID]:
             .order_by(col(Job.priority).desc(), col(Job.created_at))
             .limit(limit)
         )
+        if job_id is not None:
+            query = query.where(col(Job.id) == job_id)
         if settings.is_postgres:
             query = query.with_for_update(skip_locked=True)
         candidates = (await session.exec(query)).all()
@@ -159,23 +163,40 @@ async def touch(job_id: uuid.UUID, worker_id: str, seconds: float) -> bool:
     return result.rowcount == 1
 
 
-async def complete(job_id: uuid.UUID, result: Any, *, worker_id: str | None = None) -> bool:
+def _scrubbed_names() -> list[str]:
+    from app.tasks.registry import REGISTRY
+
+    return [name for name, task in REGISTRY.items() if task.scrub_payload]
+
+
+def _scrubs(name: str) -> bool:
+    try:
+        return get_task(name).scrub_payload
+    except LookupError:
+        return False
+
+
+async def complete(
+    job_id: uuid.UUID, result: Any, *, worker_id: str | None = None, scrub: bool = False
+) -> bool:
     """Marca el trabajo como terminado. Con `worker_id`, solo si sigue siendo suyo:
-    devuelve False si otro worker lo reclamó entretanto (arrendamiento perdido)."""
+    devuelve False si otro worker lo reclamó entretanto (arrendamiento perdido).
+    `scrub` vacía el payload (tareas con datos personales)."""
     if result is not None and _json_size(result) > settings.JOBS_MAX_RESULT_BYTES:
         result = {"truncated": True, "detail": "Result too large to store"}
+    values: dict[str, Any] = {
+        "status": JobStatus.succeeded,
+        "result": result,
+        "error": None,
+        "finished_at": utcnow(),
+        "locked_by": None,
+        "locked_until": None,
+    }
+    if scrub:
+        values["payload"] = {}
     async with SessionFactory() as session:
         done = await session.execute(
-            update(Job)
-            .where(*_leased(job_id, worker_id))
-            .values(
-                status=JobStatus.succeeded,
-                result=result,
-                error=None,
-                finished_at=utcnow(),
-                locked_by=None,
-                locked_until=None,
-            )
+            update(Job).where(*_leased(job_id, worker_id)).values(**values)
         )
         await session.commit()
     return done.rowcount == 1
@@ -206,6 +227,8 @@ async def fail(
             )
         else:
             values.update(status=JobStatus.failed, finished_at=utcnow())
+            if _scrubs(job.name):
+                values["payload"] = {}
         result = await session.execute(
             update(Job).where(*_leased(job_id, worker_id)).values(**values)
         )
@@ -227,19 +250,21 @@ async def reclaim_stale() -> int:
             .where(stale, expired, col(Job.attempts) < col(Job.max_attempts))
             .values(status=JobStatus.queued, locked_by=None, locked_until=None, run_after=now)
         )
+        lost = {
+            "status": JobStatus.failed,
+            "error": "Worker lost while running the job",
+            "finished_at": now,
+            "locked_by": None,
+            "locked_until": None,
+        }
+        # Las tareas con datos personales también se vacían aquí (SEC-43, REQ-Q03).
+        private = _scrubbed_names()
         failed = await session.execute(
-            update(Job)
-            .where(stale, expired)
-            .values(
-                status=JobStatus.failed,
-                error="Worker lost while running the job",
-                finished_at=now,
-                locked_by=None,
-                locked_until=None,
-            )
+            update(Job).where(stale, expired, col(Job.name).in_(private)).values(**lost, payload={})
         )
+        failed_rest = await session.execute(update(Job).where(stale, expired).values(**lost))
         await session.commit()
-    total = retried.rowcount + failed.rowcount
+    total = retried.rowcount + failed.rowcount + failed_rest.rowcount
     if total:
         logger.warning("reclaimed %s stale jobs", total)
     return total
@@ -247,10 +272,13 @@ async def reclaim_stale() -> int:
 
 async def cancel(session: AsyncSession, job: Job) -> bool:
     """Cancela un trabajo aún en cola. Devuelve False si ya empezó o terminó."""
+    values: dict[str, Any] = {"status": JobStatus.cancelled, "finished_at": utcnow()}
+    if _scrubs(job.name):
+        values["payload"] = {}  # SEC-43
     result = await session.execute(
         update(Job)
         .where(col(Job.id) == job.id, col(Job.status) == JobStatus.queued)
-        .values(status=JobStatus.cancelled, finished_at=utcnow())
+        .values(**values)
     )
     await session.commit()
     return result.rowcount == 1

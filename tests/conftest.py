@@ -9,6 +9,9 @@ _tmp = Path(tempfile.mkdtemp(prefix="apitest-"))
 os.environ.update(
     {
         "APIGEN_NO_GRAPH": "1",
+        # Los tests no leen el .env local del proyecto (p. ej. el que deja `make new-api`
+        # con la configuración de correo del cliente): todo lo necesario se fija aquí.
+        "APP_ENV_FILE": str(_tmp / "tests-do-not-read.env"),
         "ENVIRONMENT": "testing",
         "DATABASE_URL": f"sqlite+aiosqlite:///{_tmp / 'test.db'}",
         "SECRET_KEY": secrets.token_urlsafe(48),
@@ -20,6 +23,16 @@ os.environ.update(
         "DOCS_ENABLED": "true",
         "LOG_LEVEL": "WARNING",
         "ALLOW_REGISTRATION": "true",
+        # Correo: backend en memoria y flujos de cuenta apagados (cada test los activa
+        # con la fixture `mail`); sin cortacircuitos global (lo prueba su propio test).
+        "EMAIL_BACKEND": "memory",
+        "EMAIL_VERIFICATION": "off",
+        "PASSWORD_RESET": "false",
+        "EMAIL_DELIVERY": "queue",
+        "EMAIL_MAX_PER_HOUR": "0",
+        "EMAIL_MAX_PER_DAY": "0",
+        "EMAIL_MAX_SECURITY_PER_HOUR": "0",
+        "EMAIL_MAX_SECURITY_PER_DAY": "0",
     }
 )
 
@@ -53,6 +66,33 @@ async def _database():
 def _reset_rate_limits():
     limiter.reset()
     yield
+
+
+@pytest.fixture
+def outbox():
+    """Correos "enviados" con el backend en memoria (se vacía en cada test)."""
+    from app.email.backends import memory
+
+    memory.outbox.clear()
+    yield memory.outbox
+    memory.outbox.clear()
+
+
+@pytest.fixture
+def mail(monkeypatch, outbox):
+    """Activa recuperación y verificación (`optional`) con enlaces a un frontend de
+    ejemplo. Devuelve el outbox; ejecuta los trabajos con `process_pending()`."""
+    from app.core.config import settings
+
+    for key, value in {
+        "FRONTEND_URL": "https://app.example.com",
+        "EMAIL_FROM": "no-reply@example.com",
+        "PASSWORD_RESET": True,
+        "EMAIL_VERIFICATION": "optional",
+        "EMAIL_PER_ACCOUNT_COOLDOWN_SECONDS": 0,
+    }.items():
+        monkeypatch.setattr(settings, key, value)
+    return outbox
 
 
 @pytest.fixture

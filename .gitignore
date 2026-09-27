@@ -48,3 +48,6 @@ graphify-out/.graphify_*.json
 !graphify-out/.graphify_labels.json
 graphify-out/.graphify_labels.json.sig
 graphify-out/20*/
+
+# Correos de desarrollo (EMAIL_BACKEND=file) y vistas previas (apigen email preview)
+var/

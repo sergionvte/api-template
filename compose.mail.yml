@@ -11,7 +11,7 @@
 # puertos solo escuchan en 127.0.0.1. Nunca lo expongas ni lo uses en producción.
 services:
   mailpit:
-    image: axllent/mailpit:v1.27
+    image: axllent/mailpit:v1.33
     ports:
       - "127.0.0.1:8025:8025"
       - "127.0.0.1:1025:1025"

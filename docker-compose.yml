@@ -1,7 +1,8 @@
 # Entorno completo: API + worker + PostgreSQL + Redis, siempre en modo producción.
 #   cp .env.example .env  (o `apigen init-env --production`, que rellena los secretos)
-#   edita .env: SECRET_KEY (`openssl rand -base64 48`), POSTGRES_PASSWORD
-#   (`openssl rand -hex 24`), ALLOWED_HOSTS (obligatorio), CORS_ORIGINS...
+#   edita .env: SECRET_KEY (`openssl rand -base64 48`), POSTGRES_PASSWORD y
+#   REDIS_PASSWORD (`openssl rand -hex 24`), AUDIT_HMAC_KEY (`apigen secret`),
+#   ALLOWED_HOSTS (obligatorio), CORS_ORIGINS...
 #   docker compose up -d --build
 # Pon delante un proxy inverso con HTTPS que envíe X-Forwarded-For/-Proto.
 services:
@@ -13,8 +14,10 @@ services:
       # puede desactivar las validaciones de producción (SEC-03).
       ENVIRONMENT: production
       DATABASE_URL: postgresql+asyncpg://api:${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}@db:5432/api
-      # Timeouts cortos: un Redis colgado no debe bloquear las peticiones.
-      RATE_LIMIT_STORAGE_URI: redis://redis:6379/0?socket_timeout=0.5&socket_connect_timeout=0.5
+      # Timeouts cortos: un Redis colgado no debe bloquear las peticiones. Con contraseña
+      # (SOC 2 CC6.1): un contenedor comprometido de la red no puede borrar los contadores
+      # del rate limit ni del bloqueo de login.
+      RATE_LIMIT_STORAGE_URI: redis://:${REDIS_PASSWORD:?define REDIS_PASSWORD en .env}@redis:6379/0?socket_timeout=0.5&socket_connect_timeout=0.5
       # Solo se confía en X-Forwarded-For/-Proto del gateway de la red `backend`: es la
       # IP con la que llega al contenedor un proxy del HOST (nginx/Caddy en el host
       # conectando a 127.0.0.1:8000). Si tu proxy es otro contenedor, dale una IP
@@ -91,9 +94,14 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # La contraseña llega por entorno (no en la línea de órdenes del compose); REDISCLI_AUTH
+    # evita pasarla con -a en el healthcheck.
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?define REDIS_PASSWORD en .env}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?define REDIS_PASSWORD en .env}
+    command: ["sh", "-c", "exec redis-server --save '' --appendonly no --requirepass \"$$REDIS_PASSWORD\""]
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
       retries: 10
     networks: [backend]

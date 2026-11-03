@@ -419,6 +419,29 @@ escribir `uv run` delante de todo, activa el entorno: `source .venv/bin/activate
     - Si hay registro público: EMAIL_VERIFICATION=required y el correo del
       cliente configurado (sección 17), con SPF/DKIM/DMARC en su dominio.
 
+  Cliente con requisitos SOC 2 / ISO 27701 (o simplemente datos personales):
+    - En las specs marca los datos personales y su finalidad:
+        purpose: Seguimiento de pacientes
+        fields:
+          phone: {type: str, pii: true}
+          diagnosis: {type: text, sensitive: true}   # salud, ideología...
+      sensitive = solo dueño/admin, sin filtros ni orden, cifrado en la BD.
+      En la CLI: -f phone:str:pii  -f diagnosis:text:sensitive
+    - `apigen privacy inventory` -> docs/DATA_INVENTORY.md; rellena la tabla
+      «A completar» (responsable, base legal, encargados). Se actualiza solo al
+      generar recursos y CI comprueba que está al día.
+    - .env: AUDIT_HMAC_KEY y DATA_ENCRYPTION_KEY (init-env las crea). Guarda la
+      de datos en un gestor de secretos: sin ella no se recupera lo cifrado.
+    - Programa `apigen db prune` a diario y `apigen users review --json` cada
+      trimestre (guárdalo como evidencia).
+    - Envía los logs JSON a un SIEM y verifica la cadena con
+      `apigen audit verify`.
+    - Los usuarios ya pueden descargar sus datos (GET /users/me/export) y
+      borrar su cuenta (DELETE /users/me). Si alguien no puede entrar:
+      `apigen users export --email X`.
+    - Todo el detalle (y lo que es responsabilidad organizativa):
+      docs/CUMPLIMIENTO_SOC2_ISO27701.md.
+
   Revisión de seguridad con agentes (cuando hagas cambios grandes):
     En Claude Code, dentro del repo, pide por ejemplo:
       "usa el agente security-expert para auditar los cambios"

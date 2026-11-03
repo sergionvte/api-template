@@ -149,3 +149,25 @@ La sesión principal verificó después: 132 tests, ruff limpio, `pip-audit` sin
 **Pospuesto o aceptado en la ronda 8:**
 - `response_model` opcional por acción;
 - el límite de trabajos pendientes en SQLite puede pasarse un poco en ráfagas (en PostgreSQL está serializado por usuario).
+
+---
+
+## Ronda 9 (2026-11-03): hardening SOC 2 / ISO 27701
+
+Detalle completo, con la correspondencia con los criterios, las evidencias, los
+procedimientos y la responsabilidad del operador: `docs/CUMPLIMIENTO_SOC2_ISO27701.md`
+(va también a los proyectos de cliente).
+
+| Ámbito | Cambio |
+|---|---|
+| API generada | Auditoría encadenada con HMAC + `apigen audit verify`. `GET /users/me/export` y `DELETE /users/me`. Retención de cuentas sin verificar y de filas con soft delete. IP truncada en el log de acceso. Cifrado AES-256-GCM de los campos `sensitive`, con rotación de clave. |
+| Generador | `pii`, `sensitive` y `purpose` en las specs. Reglas de privacidad desde el diseño (sensitive solo para dueño/admin, sin filtros, orden, unique ni index). Avisos (pii público, falta `purpose`, FK a user con RESTRICT). Clasificación en `Column.info` y en el OpenAPI. Test generado de exportación y supresión. `apigen privacy inventory` se mantiene solo al día. |
+| Operación | `apigen users review`, `users export` y `users revoke-sessions`. `init-env` genera las claves nuevas y la contraseña de Redis. `apigen check` muestra auditoría, privacidad y retención. |
+| Cadena de suministro | Redis con `requirepass` en compose. CI (lint, tests, pip-audit, inventario, generación del ejemplo, build de la imagen) y Dependabot. |
+
+Tests del repo: 322 → **363**. Generados: shop 392 y cursos 398, en verde.
+
+**Pendiente:**
+- validar Redis con contraseña en Docker (el daemon no estaba disponible);
+- fijar las imágenes y acciones por digest;
+- revisión de esta ronda por los agentes `security-expert` y `user`.

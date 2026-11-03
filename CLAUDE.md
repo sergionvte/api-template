@@ -17,6 +17,9 @@ Documentación: `README.txt` (repo), `guia/README.txt` (uso), `security/REVISION
   Procesos pesados: acciones `background: true` en el YAML → `app/tasks/resources/`
   y `apigen worker` (cola en la tabla `jobs`, sin broker). Tests: `process_pending()`.
 - Nuevos proyectos: `make new-api NAME=x` (scripts/new_api.py). README.md para clientes: `apigen docs`.
+- Privacidad/cumplimiento: `docs/CUMPLIMIENTO_SOC2_ISO27701.md`. Campos `pii`/`sensitive` y
+  `purpose` en las specs; `sensitive` se cifra (app/db/crypto.py). Tablas nuevas con datos
+  de usuario: FK a `users.id` (la exportación y la supresión las descubren solas).
 - Agentes de revisión en `.claude/agents/` (security-expert, developer, user);
   laboratorio aislado: `./security/lab.sh <puerto>`.
 - No reintroducir `SlowAPIMiddleware`: con FastAPI >= 0.140 no aplica límites

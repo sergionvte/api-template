@@ -123,6 +123,8 @@ T = {
             "| Method | Path | Who | Description |\n|---|---|---|---|\n"
             "| GET / PATCH | `{p}/users/me` | Logged-in user | Own profile |\n"
             "| POST | `{p}/users/me/password` | Logged-in user | Change password (closes all sessions) |\n"
+            "| GET | `{p}/users/me/export` | Logged-in user | Download a JSON copy of all your data (5/hour) |\n"
+            '| DELETE | `{p}/users/me` | Logged-in user | Delete your account and everything you own; body `{{"current_password": "…"}}` (irreversible; `403 self_deletion_disabled` if the operator turned it off) |\n'
             "| GET / POST | `{p}/users` | Admins | List / create users |\n"
             "| GET / PATCH / DELETE | `{p}/users/{{id}}` | Admins | Manage a user (role, active) |\n"
             "| POST | `{p}/users/{{id}}/unlock` | Admins | Unlock a locked account |\n"
@@ -362,6 +364,8 @@ T["es"] = {
         "| Método | Ruta | Quién | Descripción |\n|---|---|---|---|\n"
         "| GET / PATCH | `{p}/users/me` | Usuario autenticado | Perfil propio |\n"
         "| POST | `{p}/users/me/password` | Usuario autenticado | Cambiar contraseña (cierra sesiones) |\n"
+        "| GET | `{p}/users/me/export` | Usuario autenticado | Descargar en JSON una copia de todos tus datos (5/hora) |\n"
+        '| DELETE | `{p}/users/me` | Usuario autenticado | Borrar tu cuenta y todo lo tuyo; cuerpo `{{"current_password": "…"}}` (irreversible; `403 self_deletion_disabled` si el operador lo desactivó) |\n'
         "| GET / POST | `{p}/users` | Admins | Listar / crear usuarios |\n"
         "| GET / PATCH / DELETE | `{p}/users/{{id}}` | Admins | Gestionar un usuario (rol, activo) |\n"
         "| POST | `{p}/users/{{id}}/unlock` | Admins | Desbloquear una cuenta |\n"

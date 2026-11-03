@@ -33,6 +33,9 @@ def test_init_env_output_loads(fake_project, production):
     text = env_file.read_text()
     assert "DOCS_ENABLED=\n" in text and "LOG_JSON=\n" in text
     assert "POSTGRES_PASSWORD=\n" not in text  # se genera una aleatoria
+    # Y también la de Redis y la clave de la cadena de auditoría (hardening SOC 2).
+    assert "REDIS_PASSWORD=\n" not in text and "AUDIT_HMAC_KEY=\n" not in text
+    assert "DATA_ENCRYPTION_KEY=\n" not in text
     if production:
         # En producción debe fallar SOLO por lo que el usuario tiene que rellenar.
         with pytest.raises(ValidationError) as exc:

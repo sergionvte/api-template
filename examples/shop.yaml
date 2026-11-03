@@ -41,14 +41,17 @@ resources:
 
   - name: order
     description: Pedidos; cada usuario solo ve los suyos
+    # Finalidad del tratamiento: va al inventario (apigen privacy inventory).
+    purpose: Gestión y entrega de los pedidos del cliente
     owned: true
     fields:
       product_id: {type: fk, to: product}
       quantity: {type: int, ge: 1, le: 100}
-      notes: {type: text, max_length: 500, nullable: true}
+      notes: {type: text, max_length: 500, nullable: true, pii: true}
       delivery_at: {type: datetime, nullable: true}
       tracking_code: {type: uuid, nullable: true}
-      contact_email: {type: email}
+      # pii: dato personal (clasificación en el modelo, el OpenAPI y el inventario).
+      contact_email: {type: email, pii: true}
       internal_ref: {type: str, max_length: 40, write_only: true, nullable: true}
     filters: [product_id]
     ordering: [quantity]

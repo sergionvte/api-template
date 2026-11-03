@@ -41,12 +41,14 @@ resources:
 
   - name: enrollment
     description: Inscripciones; cada alumno solo ve las suyas
+    purpose: Seguimiento académico del alumno y emisión de certificados
     owned: true
     fields:
       course_id: {type: fk, to: course, on_delete: restrict}
       progress: {type: int, ge: 0, le: 100, default: 0}
       completed_at: {type: datetime, nullable: true}
-      private_notes: {type: text, max_length: 1000, nullable: true, write_only: true}
+      # sensitive: solo dueño/admin la leen y no se puede filtrar ni ordenar por ella.
+      private_notes: {type: text, max_length: 1000, nullable: true, write_only: true, sensitive: true}
     filters: [course_id]
     ordering: [progress]
     actions:

@@ -70,6 +70,8 @@ ignore = ["B008", "S101"]
 "app/tasks/__init__.py" = ["I001"]
 # Textos del README para clientes (plantillas en/es): líneas largas a propósito.
 "apigen/docs.py" = ["E501"]
+# Tablas Markdown del inventario de datos personales.
+"apigen/privacy.py" = ["E501"]
 # Scripts de la plantilla: lanzan git/uv/graphify con argumentos fijos.
 "scripts/**" = ["S603", "S607"]
 "tests/**" = ["S105", "S106"]

@@ -1,0 +1,21 @@
+# Actualizaciones de seguridad de dependencias (SOC 2 CC7.1): Python (uv.lock), acciones
+# de GitHub y las imágenes base del Dockerfile y de docker-compose.
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly

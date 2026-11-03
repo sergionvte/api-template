@@ -51,6 +51,7 @@ EXCLUDE = (
     "scripts/",  # herramientas de la plantilla
     "tests/test_new_api.py",  # test de este script (contiene secretos falsos a propósito)
     "README.txt",  # documentación de la plantilla: el proyecto lleva README.md para el cliente
+    "README.md",  # presentación (portafolio) de la plantilla: `apigen docs` crea el del cliente
     "CLAUDE.md",  # se genera uno propio del proyecto
     "resources/",  # el proyecto empieza sin recursos
 )
@@ -347,6 +348,9 @@ worker, versiones). README.md es para el cliente (lo genera `apigen docs`).
   configuración SOLO en `.env` (EMAIL_*, SMTP_*, MAIL_*, FRONTEND_URL); plantillas propias
   en `email_templates/` (`apigen email eject/preview/test`); en local, `make mail` (Mailpit).
   Tests sin correos reales: fixture `mail` (backend memory) + `process_pending()`.
+- Datos personales: marca `pii`/`sensitive` por campo y `purpose:` por recurso (inventario en
+  `docs/DATA_INVENTORY.md`, se actualiza solo; CI lo comprueba). `sensitive` = solo dueño/admin,
+  cifrado en la BD (DATA_ENCRYPTION_KEY). Cumplimiento: `docs/CUMPLIMIENTO_SOC2_ISO27701.md`.
 - Antes de dar algo por terminado: `uv run pytest` y `uv run ruff check .`.
 - Al terminar (o al cambiar recursos): `uv run apigen docs` regenera README.md para el
   cliente (recuerda el idioma, `{lang}`; los errores `APIError(..., code=...)` de los hooks

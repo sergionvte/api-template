@@ -752,3 +752,105 @@ def test_account_flow_names_are_reserved(name):
 
     with pytest.raises(ValidationError, match="reservado"):
         _spec(name=name)
+
+
+# --- Privacidad desde el diseño (hardening SOC 2 / ISO 27701) ---------------------
+def _owned_private(**field) -> ResourceSpec:
+    return _spec(owned=True, fields={"title": {"type": "str"}, "diagnosis": field})
+
+
+def test_sensitive_field_requires_owner_or_admin_reads():
+    with pytest.raises(ValidationError, match="sensitive"):
+        _spec(fields={"diagnosis": {"type": "text", "sensitive": True}})  # read=user
+    blog = {"list": "public", "read": "public"}
+    with pytest.raises(ValidationError, match="sensitive"):
+        _spec(
+            owned=True,
+            shared_read=True,
+            permissions=blog,
+            fields={"d": {"type": "text", "sensitive": True}},
+        )
+    spec = _owned_private(type="text", sensitive=True)
+    assert spec.fields["diagnosis"].pii  # sensitive implica pii
+    admin_only = {"list": "admin", "read": "admin"}
+    _spec(permissions=admin_only, fields={"d": {"type": "text", "sensitive": True}})
+
+
+@pytest.mark.parametrize("attr", ["filters", "search", "ordering"])
+def test_sensitive_field_cannot_be_queried(attr):
+    with pytest.raises(ValidationError, match="sensitive"):
+        _spec(owned=True, fields={"code": {"type": "str", "sensitive": True}}, **{attr: ["code"]})
+
+
+def test_sensitive_field_cannot_be_unique_or_indexed():
+    with pytest.raises(ValidationError, match="unique"):
+        _owned_private(type="str", sensitive=True, unique=True)
+    with pytest.raises(ValidationError, match="index"):
+        _owned_private(type="str", sensitive=True, index=True)
+
+
+def test_pii_warnings():
+    public = _spec(
+        permissions={"list": "public", "read": "public"},
+        fields={"name": {"type": "str", "pii": True}},
+    )
+    warnings = public.warnings()
+    assert any("sin login" in w for w in warnings)
+    assert any("purpose" in w for w in warnings)
+    with_purpose = _spec(purpose="Directorio", fields={"name": {"type": "str", "pii": True}})
+    assert with_purpose.warnings() == []
+    blocking = _spec(fields={"author": {"type": "fk", "to": "user"}})
+    assert any("DELETE /users/me" in w for w in blocking.warnings())
+
+
+def test_classification_reaches_model_and_openapi(tmp_path):
+    spec = _spec(
+        owned=True,
+        purpose="Fichas",
+        fields={
+            "name": {"type": "str", "pii": True},
+            "diagnosis": {"type": "text", "sensitive": True, "nullable": True},
+            "token": {"type": "str", "write_only": True},
+        },
+    )
+    files = _files(spec, tmp_path)
+    assert "sa_column_kwargs={'info': {'pii': True}}" in files["model"]
+    assert "{'pii': True, 'sensitive': True}" in files["model"]
+    # sensitive de texto: cifrado en reposo.
+    assert "diagnosis: str | None = Field(default=None, sa_type=EncryptedText" in files["model"]
+    assert "from app.db.crypto import EncryptedText" in files["model"]
+    assert "{'write_only': True}" in files["model"]
+    assert "'x-data-classification': 'sensitive'" in files["schemas"]
+    ast.parse(files["model"])
+    ast.parse(files["schemas"])
+
+
+def test_classification_roundtrips_through_cli_and_yaml():
+    from apigen.spec import spec_to_data
+
+    name, field = parse_field_option("phone:str:max=20:pii")
+    assert field.pii and not field.sensitive
+    spec = _spec(owned=True, purpose="Contacto", fields={name: field.model_dump()})
+    data = spec_to_data(spec)
+    assert data["purpose"] == "Contacto" and data["fields"]["phone"]["pii"] is True
+    assert "sensitive" not in data["fields"]["phone"]
+    assert ResourceSpec.model_validate(data).fields["phone"].pii
+
+
+def test_privacy_inventory(tmp_path):
+    from apigen.privacy import END, merge_inventory, render_inventory
+
+    spec = _spec(
+        owned=True,
+        soft_delete=True,
+        purpose="Historial clínico del paciente",
+        fields={"diagnosis": {"type": "text", "sensitive": True}, "note": {"type": "str"}},
+    )
+    block = render_inventory([spec])
+    assert "Historial clínico del paciente" in block
+    assert "| diagnosis |" in block and "CASCADE" in block and "SOFT_DELETE_RETENTION_DAYS" in block
+    assert "`users`" in block and "users/me/export" in block
+    # Lo que completa el responsable fuera de los marcadores se conserva.
+    first = merge_inventory(None, block).replace("_(empresa, CIF, dirección)_", "ACME S.L.")
+    again = merge_inventory(first, render_inventory([]))
+    assert "ACME S.L." in again and "_(ninguno todavía)_" in again and again.count(END) == 1

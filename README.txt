@@ -178,12 +178,16 @@ partir de una línea de comandos o de un fichero YAML.
   apigen version list                              versiones y su estado
   apigen db migrate [-m "mensaje"] [--verbose]     autogenerar y aplicar migración
   apigen db upgrade | downgrade | current | history   (--verbose: log de Alembic)
-  apigen db prune                                  purga refresh tokens antiguos
-                                                   (retención de IPs; a diario),
-                                                   tokens de cuenta y registro
-                                                   de envíos de correo
-  apigen init-env [--production]                   crear .env
-  apigen secret                                    generar SECRET_KEY
+  apigen db prune                                  política de retención (a
+                                                   diario): refresh tokens e IPs,
+                                                   tokens de cuenta, envíos,
+                                                   trabajos, cuentas sin verificar
+                                                   y filas con soft delete
+  apigen init-env [--production]                   crear .env (con SECRET_KEY,
+                                                   AUDIT_HMAC_KEY, clave de datos
+                                                   y contraseñas de BD y Redis)
+  apigen secret [--data-key]                       generar SECRET_KEY / clave de
+                                                   cifrado de datos (AES-256)
   apigen createsuperuser [--email] [--promote]     crear administrador (sin
                                                    terminal: variable
                                                    APIGEN_SUPERUSER_PASSWORD)
@@ -197,6 +201,15 @@ partir de una línea de comandos o de un fichero YAML.
                                                    email_templates/ para editarlas
   apigen users verify --email X | --all-existing   marca emails como verificados
                   [--before AAAA-MM-DD] [-y]       (auditado; al pasar a required)
+  apigen users review [--inactive-days 90] [--json] revisión de accesos (admins,
+                                                   inactivos, bloqueados)
+  apigen users export --email X [--out f.json]     exportar los datos de un
+                                                   titular (solicitud de acceso)
+  apigen users revoke-sessions --email X | --all   cerrar sesiones (incidentes)
+  apigen audit verify [logs.json ...]              integridad de la cadena de
+                                                   auditoría (logs JSON)
+  apigen privacy inventory [--check]               inventario de datos personales
+                                                   (docs/DATA_INVENTORY.md)
   apigen run                                       servidor de desarrollo
   apigen serve [--workers N]                       servidor de producción
 
@@ -415,6 +428,23 @@ partir de una línea de comandos o de un fichero YAML.
 --------------------------------------------------------------------------------
 10. SEGURIDAD
 --------------------------------------------------------------------------------
+
+  Hardening SOC 2 / ISO 27701 (controles, evidencias, procedimientos y lo que
+  le toca al operador): docs/CUMPLIMIENTO_SOC2_ISO27701.md. En breve:
+    - Auditoría encadenada con HMAC (AUDIT_HMAC_KEY) en los logs JSON;
+      `apigen audit verify` detecta eventos alterados o borrados.
+    - GET /users/me/export (acceso y portabilidad) y DELETE /users/me
+      (supresión, con contraseña; ALLOW_SELF_DELETION).
+    - Retención: `apigen db prune` borra también cuentas sin verificar
+      (UNVERIFIED_ACCOUNT_RETENTION_DAYS) y filas con soft delete
+      (SOFT_DELETE_RETENTION_DAYS). IP truncada en el log de acceso.
+    - Specs: `pii: true` / `sensitive: true` por campo y `purpose:` por recurso.
+      Un campo sensitive solo lo leen dueño/admin, no se filtra ni ordena por
+      él y se cifra en reposo con AES-256-GCM (DATA_ENCRYPTION_KEY).
+    - Inventario de datos: `apigen privacy inventory` (CI lo comprueba).
+    - Revisión de accesos (`apigen users review`), respuesta a incidentes
+      (`apigen users revoke-sessions`), Redis con contraseña en compose, CI y
+      Dependabot (.github/).
 
   Resumen: security/REVISION_SEGURIDAD.md. Revisión en 4 rondas realizada por
   tres agentes (experto en ciberseguridad, desarrollador y usuario); los

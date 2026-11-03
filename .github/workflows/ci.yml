@@ -1,0 +1,74 @@
+# Control de cambios (SOC 2 CC8.1) y gestión de vulnerabilidades (CC7.1): ningún cambio
+# llega a main sin lint, tests, auditoría de dependencias e inventario de datos al día.
+# Protege la rama main en GitHub (Settings > Branches) exigiendo este workflow y una
+# revisión: así queda la evidencia de quién aprobó cada cambio.
+#
+# Las acciones van por versión mayor; para fijarlas por SHA (recomendado en SOC 2),
+# Dependabot (.github/dependabot.yml) mantiene las referencias al día.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - name: Dependencias (lockfile congelado)
+        run: uv sync --frozen
+      - name: Lint
+        run: uv run ruff check .
+      - name: Tests
+        run: uv run pytest -q -p no:cacheprovider
+      - name: Vulnerabilidades conocidas en dependencias (pip-audit)
+        run: make audit
+      - name: Inventario de datos personales al día (ISO 27701 7.2.8)
+        run: uv run apigen privacy inventory --check
+
+  generator:
+    # Solo en la plantilla (sin recursos propios): genera el ejemplo completo en una copia
+    # y ejecuta sus tests, como pide CLAUDE.md para los cambios en apigen/templates/.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - name: Generar examples/shop.yaml y probarlo
+        run: |
+          if ls resources/*.yaml >/dev/null 2>&1 || [ ! -f examples/shop.yaml ]; then
+            echo "Proyecto con recursos propios: se omite"; exit 0
+          fi
+          copy="$RUNNER_TEMP/shop"
+          mkdir -p "$copy"
+          git ls-files -z | xargs -0 -I{} cp --parents {} "$copy"
+          cd "$copy"
+          uv sync --frozen
+          APIGEN_NO_GRAPH=1 uv run apigen generate examples/shop.yaml
+          uv run ruff check .
+          uv run pytest -q -p no:cacheprovider
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: La imagen de producción se construye
+        run: docker build -t api:ci .

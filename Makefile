@@ -1,4 +1,4 @@
-.PHONY: install env dev test lint format migrate check audit loadtest graph graph-query worker mail new-api docs deliver
+.PHONY: install env dev test lint format migrate check audit inventory loadtest graph graph-query worker mail new-api docs deliver
 
 install:        ## Instala dependencias (incluye dev)
 	uv sync
@@ -34,6 +34,9 @@ check:          ## Valida la configuración
 audit:          ## Auditoría de dependencias (vulnerabilidades conocidas)
 	uv export --frozen --no-hashes --no-emit-project --format requirements-txt \
 		| uvx pip-audit --no-deps --disable-pip -r /dev/stdin
+
+inventory:      ## Inventario de datos personales (docs/DATA_INVENTORY.md, ISO 27701)
+	uv run apigen privacy inventory
 
 loadtest:       ## Prueba de estrés (ver README §8)
 	./loadtests/run_loadtest.sh

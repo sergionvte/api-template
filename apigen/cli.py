@@ -53,6 +53,15 @@ users_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(users_app, name="users")
+audit_app = typer.Typer(
+    help="Registro de auditoría (integridad de la cadena).", no_args_is_help=True
+)
+app.add_typer(audit_app, name="audit")
+privacy_app = typer.Typer(
+    help="Privacidad: inventario de datos personales (registro de actividades).",
+    no_args_is_help=True,
+)
+app.add_typer(privacy_app, name="privacy")
 
 
 def _fail(message: str) -> None:
@@ -66,6 +75,32 @@ def _refresh_graph(base) -> None:
     if message:
         ok = message.startswith("grafo actualizado")
         typer.secho(f"  {message}", fg=None if ok else typer.colors.YELLOW)
+
+
+INVENTORY = Path("docs/DATA_INVENTORY.md")
+
+
+def _inventory(base: Path, path: Path) -> tuple[str | None, str]:
+    """(contenido actual, contenido al día) del inventario de datos personales."""
+    from apigen.privacy import merge_inventory, render_inventory
+
+    if str(base) not in sys.path:
+        sys.path.insert(0, str(base))
+    specs = list(project.load_all_specs(base).values())
+    current = path.read_text(encoding="utf-8") if path.exists() else None
+    return current, merge_inventory(current, render_inventory(specs))
+
+
+def _refresh_inventory(base: Path) -> None:
+    """Tras generar o quitar recursos, mantiene al día el inventario si el proyecto lo
+    tiene (así `apigen privacy inventory --check` no falla en CI por un olvido)."""
+    path = base / INVENTORY
+    if not path.exists():
+        return
+    current, updated = _inventory(base, path)
+    if updated != current:
+        path.write_text(updated, encoding="utf-8")
+        typer.echo(f"  inventario de datos actualizado ({INVENTORY})")
 
 
 def _print_log(lines: list[str]) -> None:
@@ -112,6 +147,9 @@ def add(
         ),
     ] = None,
     description: Annotated[str | None, typer.Option(help="Descripción")] = None,
+    purpose: Annotated[
+        str | None, typer.Option(help="Finalidad del tratamiento (inventario de datos)")
+    ] = None,
     force: Annotated[bool, typer.Option(help="Sobrescribir ficheros existentes")] = False,
     dry_run: Annotated[bool, typer.Option(help="Mostrar qué se generaría sin escribir")] = False,
     tests: Annotated[bool, typer.Option("--tests/--no-tests", help="Generar tests")] = True,
@@ -137,6 +175,7 @@ def add(
             name=name,
             plural=plural,
             description=description,
+            purpose=purpose,
             owned=owned,
             soft_delete=soft_delete,
             shared_read=shared_read,
@@ -211,6 +250,7 @@ def _generate(
     _warn_specs(specs)
     if dry_run:
         return
+    _refresh_inventory(base)
     verb = "update" if existed else "add"
     if migrate:
         # _migrate actualiza el grafo si crea una migración; si no, se hace aquí.
@@ -246,6 +286,7 @@ def remove(
         _fail(str(exc))
     typer.secho(f"✓ Eliminado {name}", fg=typer.colors.GREEN)
     _print_log(log)
+    _refresh_inventory(base)
     _refresh_graph(base)
     typer.echo(f'\nPara borrar la tabla: apigen db migrate -m "drop {name}"')
 
@@ -348,6 +389,12 @@ Sintaxis CLI:  nombre:tipo[:opción][:clave=valor]...   (pon cada -f entre comil
 Opciones:  nullable unique index immutable write_only
            max= min= ge= le= gt= lt= digits= places= default= example= pattern=
            on_delete=CASCADE|SET NULL|RESTRICT description=
+
+Privacidad (SOC 2 / ISO 27701):
+  phone:str:max=20:pii                dato personal (va al inventario y al OpenAPI)
+  diagnosis:text:sensitive            categoría especial: solo dueño/admin lo leen,
+                                      sin filtros/orden y cifrado en la BD (AES-256)
+  --purpose "Seguimiento de pacientes"   finalidad del tratamiento del recurso
 
 Niveles de permiso (--perm accion=nivel): public | user | owner | admin
   acciones: list read create update delete
@@ -565,26 +612,47 @@ def db_current(verbose: Verbose = False) -> None:
 
 @db_app.command("prune")
 def db_prune() -> None:
-    """Borra refresh tokens de sesiones muertas con más de LOGIN_FAMILIAR_DAYS días
-    (y con ellos la IP guardada) y trabajos terminados con más de JOBS_RETENTION_DAYS.
-    Prográmalo a diario (cron, CronJob...)."""
+    """Aplica la política de retención. Borra:
+    refresh tokens de sesiones muertas con más de LOGIN_FAMILIAR_DAYS días (y con ellos
+    la IP guardada), trabajos terminados con más de JOBS_RETENTION_DAYS, tokens de
+    cuenta y registros de envío caducados, cuentas nunca verificadas
+    (UNVERIFIED_ACCOUNT_RETENTION_DAYS, solo con EMAIL_VERIFICATION=required) y filas
+    borradas lógicamente (SOFT_DELETE_RETENTION_DAYS).
+    Prográmalo a diario (cron, CronJob...): queda en el log de auditoría."""
     os.chdir(project.root())
     sys.path.insert(0, str(Path.cwd()))
     asyncio.run(_prune())
 
 
 async def _prune() -> None:
+    from app.core.audit import audit
     from app.core.config import settings
+    from app.core.logging import setup_logging
     from app.db.session import SessionFactory, engine
     from app.services.account_tokens import prune as prune_account_tokens
     from app.services.auth import prune_refresh_tokens
+    from app.services.privacy import prune_soft_deleted, prune_unverified_users
     from app.tasks.queue import prune_jobs
 
+    setup_logging()
     async with SessionFactory() as session:
         removed = await prune_refresh_tokens(session)
         tokens_removed, logs_removed = await prune_account_tokens(session)
+        users_removed = await prune_unverified_users(session)
+        soft_removed = await prune_soft_deleted(session)
     jobs_removed = await prune_jobs()
     await engine.dispose()
+    # Evidencia de que la política de retención se ejecuta (SOC 2 C1.2, ISO 27701 7.4.7).
+    audit(
+        "retention.prune",
+        actor="cli",
+        refresh_tokens=removed,
+        account_tokens=tokens_removed,
+        email_log=logs_removed,
+        jobs=jobs_removed,
+        unverified_users=users_removed,
+        soft_deleted_rows=soft_removed,
+    )
     typer.secho(
         f"✓ {jobs_removed} trabajos terminados borrados "
         f"(retención: {settings.JOBS_RETENTION_DAYS} días)",
@@ -597,6 +665,12 @@ async def _prune() -> None:
     )
     typer.secho(
         f"✓ {tokens_removed} tokens de cuenta y {logs_removed} registros de envío borrados",
+        fg=typer.colors.GREEN,
+    )
+    typer.secho(
+        f"✓ {users_removed} cuentas sin verificar y {soft_removed} filas borradas lógicamente "
+        f"eliminadas (retención: {settings.UNVERIFIED_ACCOUNT_RETENTION_DAYS} / "
+        f"{settings.SOFT_DELETE_RETENTION_DAYS} días; 0 = sin límite)",
         fg=typer.colors.GREEN,
     )
 
@@ -613,9 +687,21 @@ def db_history() -> None:
 # Utilidades
 # ---------------------------------------------------------------------------
 @app.command()
-def secret(length: Annotated[int, typer.Option(min=32, max=256)] = 64) -> None:
-    """Genera una SECRET_KEY aleatoria."""
-    typer.echo(secrets.token_urlsafe(length))
+def secret(
+    length: Annotated[int, typer.Option(min=32, max=256)] = 64,
+    data_key: Annotated[
+        bool, typer.Option("--data-key", help="Clave AES-256 para DATA_ENCRYPTION_KEY")
+    ] = False,
+) -> None:
+    """Genera una SECRET_KEY (o AUDIT_HMAC_KEY) aleatoria; con --data-key, una clave de
+    cifrado de datos (32 bytes en base64)."""
+    typer.echo(_data_key() if data_key else secrets.token_urlsafe(length))
+
+
+def _data_key() -> str:
+    import base64
+
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
 
 
 @app.command("init-env")
@@ -636,6 +722,16 @@ def init_env(
         text,
         flags=re.M,
     )
+    # Hex: van dentro de una URL (redis://:clave@...) sin escapar nada.
+    text = re.sub(
+        r"^REDIS_PASSWORD=.*$", f"REDIS_PASSWORD={secrets.token_hex(24)}", text, flags=re.M
+    )
+    text = re.sub(
+        r"^AUDIT_HMAC_KEY=.*$", f"AUDIT_HMAC_KEY={secrets.token_urlsafe(48)}", text, flags=re.M
+    )
+    text = re.sub(
+        r"^DATA_ENCRYPTION_KEY=.*$", f"DATA_ENCRYPTION_KEY={_data_key()}", text, flags=re.M
+    )
     if production:
         text = re.sub(r"^ENVIRONMENT=.*$", "ENVIRONMENT=production", text, flags=re.M)
         text = re.sub(r"^DEBUG=.*$", "DEBUG=false", text, flags=re.M)
@@ -643,7 +739,10 @@ def init_env(
         text = re.sub(r"^ALLOWED_HOSTS=.*$", "ALLOWED_HOSTS=", text, flags=re.M)
     target.write_text(text, encoding="utf-8")
     target.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600: solo tu usuario puede leerlo
-    typer.secho("✓ .env creado con una SECRET_KEY nueva (permisos 600)", fg=typer.colors.GREEN)
+    typer.secho(
+        "✓ .env creado con SECRET_KEY, AUDIT_HMAC_KEY y contraseñas nuevas (permisos 600)",
+        fg=typer.colors.GREEN,
+    )
     if production:
         typer.echo(
             "\nAntes de arrancar en producción, edita .env y rellena:\n"
@@ -661,7 +760,9 @@ def init_env(
             "    FRONTEND_URL       https://... del frontend (los enlaces van ahí)\n"
             "    MAIL_BRAND_*, MAIL_SUPPORT_EMAIL, MAIL_DEFAULT_LANGUAGE\n"
             "  Prueba el envío con: apigen email test tu@example.com\n"
-            "Después: apigen check. Programa `apigen db prune` a diario (retención de IPs)."
+            "Después: apigen check. Programa a diario `apigen db prune` (retención) y\n"
+            "periódicamente `apigen users review` (revisión de accesos). Envía los logs JSON\n"
+            "a un almacén externo y comprueba su integridad con `apigen audit verify`."
         )
 
 
@@ -781,6 +882,7 @@ def check() -> None:
         ),
         ("Registro abierto", str(s.ALLOW_REGISTRATION), ok),
         *_email_rows(s, ok, warn),
+        *_privacy_rows(s, ok, warn),
     ]
     for label, value, color in rows:
         typer.echo(f"  {label:<22}", nl=False)
@@ -915,6 +1017,289 @@ async def _users_verify(email: str | None, cutoff: date | None) -> int:
         count=result.rowcount,
     )
     return result.rowcount or 0
+
+
+@users_app.command("review")
+def users_review(
+    inactive_days: Annotated[
+        int, typer.Option(min=1, help="Días sin iniciar sesión para considerar inactiva")
+    ] = 90,
+    as_json: Annotated[bool, typer.Option("--json", help="Salida JSON (evidencia)")] = False,
+) -> None:
+    """Revisión periódica de accesos (SOC 2 CC6.2/CC6.3): administradores, cuentas
+    inactivas, bloqueadas y sin verificar. Queda en el log de auditoría."""
+    import json
+
+    _load_app_settings()
+    review = asyncio.run(_users_review(inactive_days))
+    if as_json:
+        typer.echo(json.dumps(review, indent=2, ensure_ascii=False, default=str))
+        return
+    typer.secho(f"Administradores ({len(review['admins'])})", bold=True)
+    for admin in review["admins"]:
+        state = "activo" if admin["is_active"] else "DESACTIVADO"
+        last = admin["last_login_at"] or "nunca"
+        typer.echo(f"  {admin['email']:<40} {state:<12} último login: {last}")
+    typer.secho(f"\nInactivos más de {inactive_days} días ({len(review['inactive'])})", bold=True)
+    for user in review["inactive"][:50]:
+        typer.echo(f"  {user['email']:<40} {user['role']:<6} último login: {user['last_login_at']}")
+    if len(review["inactive"]) > 50:
+        typer.echo(f"  ... y {len(review['inactive']) - 50} más (usa --json)")
+    typer.echo(f"\nBloqueados ahora: {review['locked']}  ·  sin verificar: {review['unverified']}")
+    typer.echo(
+        "Revisa que cada admin siga necesitando el rol; desactiva o degrada lo que sobre "
+        "(PATCH /users/{id}) y conserva esta salida como evidencia."
+    )
+
+
+async def _users_review(inactive_days: int) -> dict:
+    from datetime import timedelta
+
+    from sqlalchemy import func, or_
+    from sqlmodel import col, select
+
+    from app.core.audit import audit
+    from app.core.logging import setup_logging
+    from app.core.permissions import Role
+    from app.db.session import SessionFactory, engine
+    from app.db.types import utcnow
+    from app.models.user import User
+
+    setup_logging()
+    now = utcnow()
+    cutoff = now - timedelta(days=inactive_days)
+    fields = ("email", "role", "is_active", "created_at", "last_login_at")
+    try:
+        async with SessionFactory() as session:
+            admins = (await session.exec(select(User).where(col(User.role) == Role.admin))).all()
+            inactive = (
+                await session.exec(
+                    select(User)
+                    .where(
+                        col(User.is_active).is_(True),
+                        or_(
+                            col(User.last_login_at) < cutoff,
+                            col(User.last_login_at).is_(None) & (col(User.created_at) < cutoff),
+                        ),
+                    )
+                    .order_by(col(User.last_login_at))
+                )
+            ).all()
+            locked = (
+                await session.exec(select(func.count()).where(col(User.locked_until) > now))
+            ).one()
+            unverified = (
+                await session.exec(
+                    select(func.count()).where(col(User.email_verified_at).is_(None))
+                )
+            ).one()
+    finally:
+        await engine.dispose()
+    review = {
+        "generated_at": now.isoformat(),
+        "inactive_days": inactive_days,
+        "admins": [{f: getattr(u, f) for f in fields} for u in admins],
+        "inactive": [{f: getattr(u, f) for f in fields} for u in inactive],
+        "locked": locked,
+        "unverified": unverified,
+    }
+    audit(
+        "admin.access_review",
+        actor="cli",
+        admins=len(admins),
+        inactive=len(inactive),
+        inactive_days=inactive_days,
+    )
+    return review
+
+
+@users_app.command("export")
+def users_export(
+    email: Annotated[str, typer.Option(help="Usuario cuyos datos se exportan")],
+    out: Annotated[Path, typer.Option(help="Fichero JSON de salida")] = Path("export.json"),
+) -> None:
+    """Solicitud de acceso atendida por el operador (ISO 27701 7.3.9), p. ej. si el
+    titular no puede iniciar sesión: el mismo JSON que GET /users/me/export. Verifica
+    antes su identidad. Queda en el log de auditoría (`privacy.export`, actor=cli)."""
+    import json
+
+    _load_app_settings()
+    data = asyncio.run(_users_export(email.strip().lower()))
+    if data is None:
+        _fail(f"No hay ningún usuario con el email {email}")
+    out.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    out.chmod(stat.S_IRUSR | stat.S_IWUSR)  # contiene datos personales: 600
+    typer.secho(f"✓ Datos exportados en {out} (permisos 600)", fg=typer.colors.GREEN)
+
+
+async def _users_export(email: str) -> dict | None:
+    from sqlmodel import select
+
+    from app.core.audit import audit
+    from app.core.logging import setup_logging
+    from app.db.session import SessionFactory, engine
+    from app.models.user import User
+    from app.services.privacy import export_user_data
+
+    setup_logging()
+    try:
+        async with SessionFactory() as session:
+            user = (await session.exec(select(User).where(User.email == email))).first()
+            if user is None:
+                return None
+            data = await export_user_data(session, user)
+    finally:
+        await engine.dispose()
+    audit("privacy.export", actor="cli", user_id=user.id)
+    return data
+
+
+@users_app.command("revoke-sessions")
+def users_revoke_sessions(
+    email: Annotated[str | None, typer.Option(help="Solo las de este usuario")] = None,
+    all_users: Annotated[bool, typer.Option("--all", help="Las de TODOS los usuarios")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="No pedir confirmación")] = False,
+) -> None:
+    """Respuesta a incidentes (SOC 2 CC7.4): invalida al instante los access tokens y
+    revoca los refresh tokens de un usuario o de todos (todos deberán iniciar sesión).
+    Tras una filtración de SECRET_KEY, rótala además (JWT_PREVIOUS_SECRET_KEYS vacío)."""
+    if bool(email) == all_users:
+        _fail("Indica --email o --all (uno de los dos)")
+    _load_app_settings()
+    if all_users and not yes:
+        typer.confirm("¿Cerrar las sesiones de TODOS los usuarios?", abort=True)
+    count = asyncio.run(_revoke_sessions(email.strip().lower() if email else None))
+    if email and not count:
+        _fail(f"No hay ningún usuario con el email {email}")
+    typer.secho(f"✓ Sesiones cerradas: {count} usuario(s)", fg=typer.colors.GREEN)
+
+
+async def _revoke_sessions(email: str | None) -> int:
+    from sqlalchemy import update
+    from sqlmodel import col, select
+
+    from app.core.audit import audit
+    from app.core.logging import setup_logging
+    from app.db.session import SessionFactory, engine
+    from app.db.types import utcnow
+    from app.models.refresh_token import RefreshToken
+    from app.models.user import User
+
+    setup_logging()
+    try:
+        async with SessionFactory() as session:
+            # token_version + 1 invalida los access tokens ya emitidos al instante.
+            query = update(User).values(token_version=col(User.token_version) + 1)
+            tokens = update(RefreshToken).where(col(RefreshToken.revoked_at).is_(None))
+            if email:
+                user_id = (await session.exec(select(User.id).where(User.email == email))).first()
+                if user_id is None:
+                    return 0
+                query = query.where(col(User.id) == user_id)
+                tokens = tokens.where(col(RefreshToken.user_id) == user_id)
+            count = (await session.execute(query)).rowcount or 0
+            await session.execute(tokens.values(revoked_at=utcnow()))
+            await session.commit()
+    finally:
+        await engine.dispose()
+    audit("admin.sessions.revoke", actor="cli", scope="user" if email else "all", count=count)
+    return count
+
+
+@privacy_app.command("inventory")
+def privacy_inventory(
+    out: Annotated[Path, typer.Option(help="Fichero de salida")] = INVENTORY,
+    check: Annotated[
+        bool, typer.Option("--check", help="No escribe: falla si no está al día (CI)")
+    ] = False,
+) -> None:
+    """Inventario de datos personales (registro de actividades, ISO 27701 7.2.8) a
+    partir de los recursos y su clasificación `pii`/`sensitive`. Conserva lo que
+    completes fuera de los marcadores (responsable, base legal, encargados...)."""
+    base = project.root()
+    os.chdir(base)
+    path = out if out.is_absolute() else base / out
+    try:
+        current, updated = _inventory(base, path)
+        specs = list(project.load_all_specs(base).values())
+    except (SpecError, ValidationError) as exc:
+        _fail(str(exc))
+    if check:
+        if current != updated:
+            _fail(f"{out} no está al día: ejecuta `apigen privacy inventory`")
+        typer.secho(f"✓ {out} al día", fg=typer.colors.GREEN)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(updated, encoding="utf-8")
+    verb = "actualizado" if current else "creado"
+    typer.secho(f"✓ {out} {verb} ({len(specs)} recurso(s))", fg=typer.colors.GREEN)
+    if current is None:
+        typer.echo("  Completa la tabla «A completar» (responsable, base legal, encargados).")
+    for spec in specs:
+        for warning in spec.warnings():
+            if "pii" in warning or "personales" in warning:
+                typer.secho(f"! {warning}", fg=typer.colors.YELLOW, err=True)
+
+
+@audit_app.command("verify")
+def audit_verify(
+    files: Annotated[
+        list[Path] | None,
+        typer.Argument(help="Logs JSON en orden (varios si están rotados); sin nada, stdin"),
+    ] = None,
+) -> None:
+    """Comprueba la cadena del log de auditoría: detecta eventos alterados, insertados
+    o borrados del medio (necesita los logs en JSON y la misma AUDIT_HMAC_KEY)."""
+    _load_app_settings()
+    from app.core.audit import verify_lines
+
+    def lines():
+        if not files:
+            yield from sys.stdin
+            return
+        for path in files:
+            if not path.is_file():
+                _fail(f"no existe {path}")
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                yield from handle
+
+    report = verify_lines(lines())
+    for note in report.notes[:20]:
+        typer.secho(f"  · {note}", fg=typer.colors.YELLOW)
+    for error in report.errors[:50]:
+        typer.secho(f"  ✗ {error}", fg=typer.colors.RED, err=True)
+    if not report.events:
+        _fail("no hay eventos de auditoría encadenados (¿LOG_JSON=true?)")
+    if not report.ok:
+        _fail(f"cadena rota: {len(report.errors)} problema(s) en {report.events} eventos")
+    typer.secho(
+        f"✓ {report.events} eventos íntegros en {report.streams} flujo(s)", fg=typer.colors.GREEN
+    )
+
+
+def _privacy_rows(s, ok: str, warn: str) -> list[tuple[str, str, str]]:
+    """Filas de auditoría, privacidad y retención de `apigen check` (SOC 2 / ISO 27701)."""
+    keyed = bool(s.AUDIT_HMAC_KEY.get_secret_value())
+    audit_text = ("HMAC" if keyed else "sin clave (AUDIT_HMAC_KEY)") + (
+        ", JSON" if s.log_json else ", texto (no verificable)"
+    )
+    unverified = s.UNVERIFIED_ACCOUNT_RETENTION_DAYS if s.email_verification == "required" else 0
+    return [
+        ("Auditoría", audit_text, ok if (keyed and s.log_json) or not s.is_production else warn),
+        ("IP en log de acceso", s.ACCESS_LOG_IP, ok),
+        (
+            "Derechos interesado",
+            "exportar + borrar cuenta" if s.ALLOW_SELF_DELETION else "exportar (borrado: admin)",
+            ok,
+        ),
+        (
+            "Retención",
+            f"sesiones {s.LOGIN_FAMILIAR_DAYS} d, trabajos {s.JOBS_RETENTION_DAYS} d, "
+            f"soft delete {s.SOFT_DELETE_RETENTION_DAYS or '∞'} d, "
+            f"sin verificar {unverified or '-'} d",
+            warn if not s.SOFT_DELETE_RETENTION_DAYS else ok,
+        ),
+    ]
 
 
 def _email_rows(s, ok: str, warn: str) -> list[tuple[str, str, str]]:

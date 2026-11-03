@@ -13,7 +13,7 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from apigen.naming import pascal
-from apigen.spec import FieldSpec, ResourceSpec, SpecError
+from apigen.spec import ENCRYPTED_TYPES, FieldSpec, ResourceSpec, SpecError
 
 # Nombres que no pueden ser miembros de un Enum (o que taparían métodos de str).
 _ENUM_FORBIDDEN = {"mro", *dir(str)}
@@ -230,7 +230,11 @@ def table_field(
     elif f.nullable:
         kw.append("default=None")
 
-    if f.type in {"str", "email"}:
+    if f.sensitive and f.type in ENCRYPTED_TYPES:
+        # Cifrado en reposo (AES-256-GCM): la longitud la valida el esquema, no la columna.
+        imports.add("from app.db.crypto import EncryptedText")
+        kw.append("sa_type=EncryptedText")
+    elif f.type in {"str", "email"}:
         kw.append(f"max_length={f.max_length}")
     elif f.type == "int" and not f.fits_int32():
         # INTEGER es de 32 bits en PostgreSQL: si el rango no cabe, BIGINT.
@@ -260,12 +264,23 @@ def table_field(
         kw.append("index=True")
     if f.description:
         kw.append(f"description={py(f.description)}")
+    # Clasificación en Column.info: la usan la exportación de datos del usuario (que
+    # omite write_only) y el inventario de datos personales. No genera migraciones.
+    info = {key: True for key in ("pii", "sensitive", "write_only") if getattr(f, key)}
+    if info:
+        kw.append(f"sa_column_kwargs={{'info': {py(info)}}}")
     return f"{fname}: {ptype} = Field({', '.join(kw)})"
+
+
+def _classification_kwargs(f: FieldSpec) -> list[str]:
+    """`x-data-classification` en el OpenAPI: el cliente sabe qué datos son personales."""
+    level = "sensitive" if f.sensitive else "pii" if f.pii else None
+    return [f"json_schema_extra={{'x-data-classification': {py(level)}}}"] if level else []
 
 
 def create_field(spec: ResourceSpec, fname: str, f: FieldSpec, imports: Imports) -> str:
     ptype = _py_type(spec, fname, f, imports, schema=True)
-    kw = _validation_kwargs(f) + _examples_kwarg(f)
+    kw = _validation_kwargs(f) + _examples_kwarg(f) + _classification_kwargs(f)
     if f.nullable:
         ptype = f"{ptype} | None"
     if f.default is not None:
@@ -278,7 +293,7 @@ def create_field(spec: ResourceSpec, fname: str, f: FieldSpec, imports: Imports)
 
 def update_field(spec: ResourceSpec, fname: str, f: FieldSpec, imports: Imports) -> str:
     ptype = _py_type(spec, fname, f, imports, schema=True)
-    kw = ["default=None", *_validation_kwargs(f)]
+    kw = ["default=None", *_validation_kwargs(f), *_classification_kwargs(f)]
     return f"{fname}: {ptype} | None = Field({', '.join(kw)})"
 
 
@@ -599,7 +614,16 @@ def build_test_context(spec: ResourceSpec, all_specs: dict[str, ResourceSpec]) -
         ),
         None,
     )
+    # Supresión de la cuenta (DELETE /users/me): se prueba si nada de lo que crea el test
+    # la bloquea con una FK a user en RESTRICT (eso ya lo avisa la spec).
+    involved = [spec, *(all_specs[s["module"]] for s in setup)]  # type: ignore[index]
+    erasure_blocked = any(
+        f.type == "fk" and f.to == "user" and f.on_delete == "RESTRICT"
+        for s in involved
+        for f in s.fields.values()
+    )
     return {
+        "privacy": spec.owned and spec.permissions.create == "user" and not erasure_blocked,
         "int_field": int_field,
         "unique_fields": sorted(n for n, f in spec.fields.items() if f.unique),
         "immutable_field": immutable_field,

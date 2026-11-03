@@ -80,6 +80,8 @@ FieldType = Literal[
 FILTERABLE = {"str", "int", "bool", "date", "uuid", "email", "enum", "fk", "decimal"}
 SEARCHABLE = {"str", "text", "email"}
 ORDERABLE = {"str", "int", "float", "decimal", "date", "datetime", "email", "enum", "bool"}
+# Tipos que se cifran en reposo cuando el campo es sensitive (app/db/crypto.py).
+ENCRYPTED_TYPES = {"str", "text", "email"}
 Level = Literal["public", "user", "owner", "admin"]
 ACTIONS = ("list", "read", "create", "update", "delete")
 INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
@@ -105,6 +107,11 @@ class FieldSpec(BaseModel):
     index: bool = False
     immutable: bool = False  # no se puede cambiar en PATCH
     write_only: bool = False  # se acepta pero nunca se devuelve
+    # Clasificación (ISO 27701 6.5.2, SOC 2 C1.1). pii: dato personal (nombre,
+    # teléfono...). sensitive: categoría especial (salud, ideología, biometría,
+    # menores...) o confidencial; implica pii y endurece los permisos del recurso.
+    pii: bool = False
+    sensitive: bool = False
     description: str | None = Field(default=None, max_length=300)
     example: Any = None
     # str / text
@@ -197,6 +204,12 @@ class FieldSpec(BaseModel):
                 raise ValueError("un campo con 'pattern' necesita 'example' (para los tests)")
         if self.unique and self.type == "bool":
             raise ValueError("un bool no puede ser unique")
+        if self.sensitive:
+            self.pii = True
+            if self.unique or (self.index and self.type != "fk"):
+                # El 409 de unicidad revelaría que otra persona tiene ese mismo valor; y un
+                # índice sobre un valor cifrado (nonce aleatorio) no sirve de nada.
+                raise ValueError("un campo sensitive no puede ser unique ni index")
         if self.default is not None:
             self.default = coerce_value(self, self.default, "default")
         if self.example is not None:
@@ -377,6 +390,9 @@ class ResourceSpec(BaseModel):
     name: str
     plural: str | None = None
     description: str | None = Field(default=None, max_length=300)
+    # Finalidad del tratamiento (ISO 27701 7.2.1): va al inventario de datos
+    # (`apigen privacy inventory`). Recomendable si hay campos pii.
+    purpose: str | None = Field(default=None, max_length=300)
     owned: bool = False
     soft_delete: bool = False
     # Recurso owned cuyas filas pueden leer otros usuarios A PROPÓSITO (p. ej. un
@@ -482,6 +498,24 @@ class ResourceSpec(BaseModel):
         check_list("search", SEARCHABLE)
         check_list("ordering", ORDERABLE, {"created_at", "updated_at"})
 
+        # Privacidad desde el diseño (ISO 27701 7.4.1/7.4.2): un dato sensible solo lo
+        # ve su dueño o un admin, y no se puede filtrar, buscar ni ordenar por él (un
+        # filtro o una ordenación permiten deducir el valor aunque no se devuelva).
+        sensitive = sorted(n for n, f in self.fields.items() if f.sensitive)
+        if sensitive:
+            open_levels = {a: getattr(p, a) for a in ("list", "read")}
+            too_open = {a: lv for a, lv in open_levels.items() if lv not in {"owner", "admin"}}
+            if too_open:
+                levels = ", ".join(f"{a}={lv}" for a, lv in too_open.items())
+                raise ValueError(
+                    f"campos sensitive ({', '.join(sensitive)}) con {levels}: solo el dueño "
+                    "(owned + owner) o un admin pueden leerlos"
+                )
+            for attr in ("filters", "search", "ordering"):
+                used = sorted(set(getattr(self, attr)) & set(sensitive))
+                if used:
+                    raise ValueError(f"{attr}: {', '.join(used)} es sensitive (no se admite)")
+
         seen: set[str] = set()
         for action in self.actions:
             if action.name in seen:
@@ -553,7 +587,24 @@ class ResourceSpec(BaseModel):
                     f"{self.name}.{action.name}: acción pública heredada de create=public "
                     "(cualquiera, sin login); pon `permission:` explícito para confirmarlo"
                 )
+        pii = sorted(n for n, f in self.fields.items() if f.pii)
+        if pii and "public" in {p.list, p.read}:
+            out.append(
+                f"{self.name}: datos personales ({', '.join(pii)}) legibles sin login "
+                "(list/read=public); confirma que es su finalidad y que hay base legal"
+            )
+        if pii and not self.purpose:
+            out.append(
+                f"{self.name}: tiene campos pii sin `purpose:` (finalidad del tratamiento, "
+                "va al inventario de `apigen privacy inventory`)"
+            )
         for fname, f in self.fields.items():
+            if f.type == "fk" and f.to == "user" and f.on_delete == "RESTRICT":
+                out.append(
+                    f"{self.name}.{fname}: FK a user con on_delete=RESTRICT -> el usuario no "
+                    "podrá borrar su cuenta (DELETE /users/me da 409) mientras tenga filas aquí. "
+                    "Para el derecho de supresión usa CASCADE o nullable + SET NULL"
+                )
             if f.type == "enum" and len(f.choices or []) == 1:
                 out.append(
                     f"{self.name}.{fname}: el enum solo tiene una opción ({f.choices[0]!r}); "
@@ -679,9 +730,11 @@ def spec_to_data(spec: ResourceSpec) -> dict[str, Any]:
     """Spec como dict para YAML, sin los valores por defecto que solo hacen ruido."""
     data = spec.model_dump(exclude_none=True, exclude_defaults=False)
     for f in data["fields"].values():
-        for key in ("nullable", "unique", "index", "immutable", "write_only"):
+        for key in ("nullable", "unique", "index", "immutable", "write_only", "pii", "sensitive"):
             if f.get(key) is False:
                 f.pop(key)
+        if f.get("sensitive"):
+            f.pop("pii", None)  # sensitive ya implica pii
     for key in ("filters", "search", "ordering"):
         if not data.get(key):
             data.pop(key, None)
@@ -701,6 +754,9 @@ def spec_to_data(spec: ResourceSpec) -> dict[str, Any]:
             for f in action.get("fields", {}).values():
                 for key in ("unique", "index", "immutable", "write_only", "on_delete"):
                     f.pop(key, None)
+                for key in ("pii", "sensitive"):
+                    if f.get(key) is False:
+                        f.pop(key)
                 if f.get("nullable") is False:
                     f.pop("nullable")
     return data
@@ -730,7 +786,7 @@ def parse_field_option(raw: str) -> tuple[str, FieldSpec]:
         "places": "decimal_places",
         "digits": "max_digits",
     }
-    flags = {"nullable", "unique", "index", "immutable", "write_only"}
+    flags = {"nullable", "unique", "index", "immutable", "write_only", "pii", "sensitive"}
     valued = {
         "max", "min", "ge", "le", "gt", "lt", "digits", "places", "default", "example",
         "pattern", "on_delete", "description", *aliases.values(),

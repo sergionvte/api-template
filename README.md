@@ -1,19 +1,19 @@
-# apigen: generador de APIs FastAPI seguras, construido con agentes de IA
+# apigen: a secure FastAPI generator, built with AI agents
 
-Plantilla y generador de código (`apigen`) que crea **APIs REST de producción** a partir de un YAML: FastAPI, SQLModel asíncrono, JWT y rate limiting. Las APIs salen ya endurecidas según **OWASP API Top 10**, **SOC 2** e **ISO/IEC 27701**.
+A template plus a code generator (`apigen`) that turns a YAML file into a **production-ready REST API**: FastAPI, async SQLModel, JWT and rate limiting. The generated APIs are already hardened against the **OWASP API Top 10** and aligned with **SOC 2** and **ISO/IEC 27701**.
 
-El proyecto se diseñó, se programó, se auditó y se endureció con **agentes de IA** (Claude Code y agentes especializados), en ciclos de revisión parecidos a los de un equipo real. Abajo se explica cómo.
+The project was designed, built, audited and hardened with **AI agents** (Claude Code plus specialized agents), in review cycles similar to those of a real team. How that worked is explained below.
 
 ```yaml
 # resources/order.yaml
 - name: order
-  owned: true                          # cada usuario solo ve sus pedidos
-  purpose: Gestión y entrega de pedidos
+  owned: true                          # each user only sees their own orders
+  purpose: Order management and delivery
   fields:
     product_id: {type: fk, to: product}
     quantity: {type: int, ge: 1, le: 100}
     contact_email: {type: email, pii: true}
-    medical_notes: {type: text, sensitive: true, nullable: true}   # se cifra con AES-256-GCM
+    medical_notes: {type: text, sensitive: true, nullable: true}   # encrypted with AES-256-GCM
   actions:
     - {name: export_invoice, background: true, rate_limit: "10/minute"}
 ```
@@ -22,128 +22,130 @@ El proyecto se diseñó, se programó, se auditó y se endureció con **agentes 
 apigen generate resources/order.yaml --migrate
 ```
 
-Con esto se genera:
-- el modelo, los esquemas y el router versionado (`/api/v1/orders`);
-- la migración de Alembic;
-- los permisos por dueño y el rate limit;
-- el endpoint en segundo plano con su cola de trabajos;
-- sus tests (CRUD, permisos, aislamiento, exportación y supresión);
-- la documentación para el cliente y el inventario de datos personales.
+This generates:
+- the model, schemas and versioned router (`/api/v1/orders`);
+- the Alembic migration;
+- owner-based permissions and rate limiting;
+- the background endpoint with its job queue;
+- its tests (CRUD, permissions, isolation, data export and erasure);
+- client-facing documentation and the personal data inventory.
 
 ---
 
-## Cómo se construyó: desarrollo con agentes de IA
+## How it was built: development with AI agents
 
-La sesión principal de **Claude Code** actúa como orquestadora. Coordina tres **agentes especializados** (definidos en `.claude/agents/`), cada uno con su papel, sus herramientas y su criterio:
+The main **Claude Code** session acts as the orchestrator. It coordinates three **specialized agents** (defined in `.claude/agents/`), each with its own role, tools and judgment:
 
-| Agente | Papel |
+| Agent | Role |
 |---|---|
-| `security-expert` | Auditor AppSec defensivo. Revisa el código con OWASP API Top 10 y ASVS L2, modela amenazas y **verifica cada hallazgo en un laboratorio aislado** (`security/lab.sh`) con scripts propios (`security/checks/`). |
-| `developer` | Backend senior. Evalúa cada informe, **decide de forma razonada** qué se corrige y qué se acepta como riesgo, y aplica las correcciones con tests. |
-| `user` | Desarrollador que usa la plantilla por primera vez. Mide la experiencia real: errores confusos, documentación y fricción que provoca la seguridad. |
+| `security-expert` | Defensive AppSec auditor. Reviews code against the OWASP API Top 10 and ASVS L2, threat-models, and **verifies every finding in an isolated lab** (`security/lab.sh`) with its own scripts (`security/checks/`). |
+| `developer` | Senior backend engineer. Evaluates each report, **decides with explicit reasoning** what gets fixed and what is accepted as risk, and ships the fixes with tests. |
+| `user` | A developer using the template for the first time. Measures the real experience: confusing errors, documentation, and friction caused by security. |
 
-**Proceso:**
-1. **Rondas iterativas.** El experto y el usuario trabajan en paralelo; el desarrollador responde punto por punto; la ronda siguiente verifica las correcciones.
-2. **La sesión principal valida cada entrega** con tests, lint, `pip-audit`, pruebas de carga y generación de ejemplos reales.
-3. **Grafo de conocimiento del código** ([graphify](https://pypi.org/project/graphifyy/)). Los agentes consultan el grafo antes de leer ficheros, lo que reduce mucho los tokens por revisión.
-4. **Las tensiones entre seguridad y usabilidad se debaten y se documentan.** Ejemplos: bloqueo de cuenta frente a denegación de servicio, enumeración de emails, periodo de gracia del refresh.
+**Process:**
+1. **Iterative rounds.** The expert and the user work in parallel; the developer answers point by point; the next round verifies the fixes.
+2. **The main session validates every delivery** with tests, lint, `pip-audit`, load tests and real generated examples.
+3. **A knowledge graph of the codebase** ([graphify](https://pypi.org/project/graphifyy/)). Agents query the graph before reading files, which greatly reduces the tokens spent per review.
+4. **Security vs. usability trade-offs are debated and documented.** Examples: account lockout vs. denial of service, email enumeration, the refresh-token grace period.
 
-| Ronda | Resultado |
+| Round | Outcome |
 |---|---|
-| 1 | Auditoría inicial: 0 críticos, 4 medios. El usuario encuentra 28 problemas de uso (valoración 5/10). |
-| 2-4 | 53 puntos resueltos. *Smart lockout*, carrera en el refresh concurrente, proxies de confianza, retención de IPs. Veredicto: **apta para producción con condiciones**. |
-| 5-6 | Revisión guiada por el grafo: 0 críticos, 0 altos y 0 medios. Usuario: **9/10**. |
-| 7-8 | Hooks, cola de trabajos y validación con Docker, PostgreSQL y Redis. Se cierran 4 hallazgos medios (BOLA en acciones, timeouts de tareas...). |
-| Fase 2 | Verificación de email, recuperación de contraseña y correo por cliente, con su propia ronda de auditoría. |
-| 9 | **Hardening SOC 2 / ISO 27701** (abajo). |
+| 1 | Initial audit: 0 critical, 4 medium. The user finds 28 usability issues (rated 5/10). |
+| 2-4 | 53 items resolved. Smart lockout, concurrent refresh race, trusted proxies, IP retention. Verdict: **production-ready with conditions**. |
+| 5-6 | Graph-guided review: 0 critical, 0 high, 0 medium. User rating: **9/10**. |
+| 7-8 | Hooks, job queue, and validation with Docker, PostgreSQL and Redis. 4 medium findings closed (BOLA in actions, task timeouts...). |
+| Phase 2 | Email verification, password recovery and per-client email, with its own audit round. |
+| 9 | **SOC 2 / ISO 27701 hardening** (see below). |
 
-Las personas definen el producto, toman las decisiones y validan el resultado. Los agentes amplían la cobertura: cada cambio relevante pasa una auditoría de seguridad y una prueba de uso, y todo queda documentado en `security/reports/` (20 informes).
-
----
-
-## Qué incluye
-
-### Generador (`apigen`)
-- **CRUD declarativo** desde YAML o CLI: 13 tipos de campo, FKs con `on_delete`, enums, soft delete, filtros, búsqueda y ordenación con listas blancas.
-- **Permisos por acción** (`public`, `user`, `owner`, `admin`) con validaciones que **impiden configuraciones inseguras**: BOLA por ID, `update` abierto en recursos con dueño, acciones públicas en segundo plano...
-- **Hooks** (`app/hooks/`) y **acciones en segundo plano** (`apigen worker`). La cola vive en la propia BD, sin broker, con executors async, thread o process y timeouts reales.
-- **Versionado de la API** (`v1`, `v2`, cabeceras de deprecación y *sunset*) y migraciones Alembic automáticas.
-- **Tests generados** por recurso: CRUD, permisos, aislamiento entre usuarios, asignación masiva, exportación y supresión de datos.
-- **Documentación para el cliente** (`apigen docs`, en/es) y colección de Postman.
-- **Generación segura de código**: identificadores validados y literales emitidos con `repr()`. Un YAML malicioso no puede inyectar código.
-
-### Seguridad de las APIs generadas
-- Argon2id (RFC 9106) y política de contraseñas. JWT de 15 min y refresh opaco con **rotación y detección de reutilización**.
-- **Bloqueo inteligente**: un tercero no puede dejar fuera al titular. Rate limiting por usuario e IP (Redis) y proxies de confianza estrictos.
-- Validación estricta (extra=forbid, límites de tamaño, NUL, enteros acotados), cabeceras de seguridad y errores con `code` estable que no filtran información.
-- La configuración insegura **impide arrancar** en producción. Contenedores sin root, read-only y con `cap_drop: ALL`.
-- Mínimo privilegio entre procesos: el worker no recibe la clave JWT y la API no recibe las credenciales SMTP.
-
-### Privacidad y cumplimiento (SOC 2 / ISO 27701)
-- **Auditoría a prueba de manipulaciones**: eventos encadenados con HMAC y `apigen audit verify`.
-- **Derechos del interesado**: `GET /users/me/export` (acceso y portabilidad) y `DELETE /users/me` (supresión en cascada).
-- **Clasificación de datos** (`pii`, `sensitive`, `purpose`) en el modelo, el OpenAPI y el **inventario de datos personales**, que CI comprueba.
-- **Cifrado en reposo** de los campos sensibles (AES-256-GCM, con rotación de claves).
-- **Retención automática**, IPs truncadas en los logs, **revisión de accesos** y **respuesta a incidentes** desde la CLI.
-- CI con lint, tests, `pip-audit`, inventario y build de la imagen, más Dependabot.
-- Matriz completa de controles, evidencias y responsabilidades: [`docs/CUMPLIMIENTO_SOC2_ISO27701.md`](docs/CUMPLIMIENTO_SOC2_ISO27701.md).
+People define the product, make the decisions and validate the result. The agents widen the coverage: every relevant change goes through a security audit and a usability test, and everything is documented in `security/reports/` (20 reports).
 
 ---
 
-## Métricas
+## What's included
+
+### Generator (`apigen`)
+- **Declarative CRUD** from YAML or the CLI: 13 field types, FKs with `on_delete`, enums, soft delete, and allow-listed filtering, search and ordering.
+- **Per-action permissions** (`public`, `user`, `owner`, `admin`) with validations that **reject insecure configurations**: BOLA by ID, open `update` on owned resources, public background actions...
+- **Hooks** (`app/hooks/`) and **background actions** (`apigen worker`). The queue lives in the database itself, with no broker, async/thread/process executors and real timeouts.
+- **API versioning** (`v1`, `v2`, deprecation and *sunset* headers) and automatic Alembic migrations.
+- **Generated tests** per resource: CRUD, permissions, user isolation, mass assignment, data export and erasure.
+- **Client documentation** (`apigen docs`, en/es) and a Postman collection.
+- **Safe code generation**: identifiers are validated and literals are emitted with `repr()`. A malicious YAML cannot inject code.
+
+### Security of the generated APIs
+- Argon2id (RFC 9106) and a password policy. 15-minute JWTs plus opaque refresh tokens with **rotation and reuse detection**.
+- **Smart lockout**: a third party cannot lock the owner out. Per-user and per-IP rate limiting (Redis) and strict trusted proxies.
+- Strict validation (extra=forbid, size limits, NUL bytes, bounded integers), security headers, and errors with a stable `code` that never leak information.
+- Insecure configuration **prevents startup** in production. Containers run as non-root, read-only, with `cap_drop: ALL`.
+- Least privilege between processes: the worker never gets the JWT key and the API never gets the SMTP credentials.
+
+### Privacy and compliance (SOC 2 / ISO 27701)
+- **Tamper-evident audit log**: events chained with HMAC, checked by `apigen audit verify`.
+- **Data subject rights**: `GET /users/me/export` (access and portability) and `DELETE /users/me` (cascading erasure).
+- **Data classification** (`pii`, `sensitive`, `purpose`) carried into the model, the OpenAPI schema and the **personal data inventory**, which CI checks.
+- **Encryption at rest** for sensitive fields (AES-256-GCM, with key rotation).
+- **Automatic retention**, truncated IPs in logs, **access reviews** and **incident response** from the CLI.
+- CI with lint, tests, `pip-audit`, the inventory check and the image build, plus Dependabot.
+- Full matrix of controls, evidence and responsibilities (in Spanish): [`docs/CUMPLIMIENTO_SOC2_ISO27701.md`](docs/CUMPLIMIENTO_SOC2_ISO27701.md).
+
+---
+
+## Metrics
 
 | | |
 |---|---|
-| Código (app + generador + plantillas) | ~13.800 líneas de Python |
-| Tests del repo | **363** (~5.000 líneas) |
-| Suite completa con los ejemplos generados | 392 tests (`shop.yaml`) y 398 (`cursos.yaml`), todos en verde |
-| Vulnerabilidades en dependencias (`pip-audit`) | **0** |
-| Carga: 500 usuarios, 60 s | 1.712 req/s, mediana 38 ms, **0 errores** |
-| Carga con tráfico hostil + rate limit | ~80.000 peticiones, **0 fallos y 0 errores 5xx** |
-| Hallazgos críticos o altos abiertos | **0** |
+| Code (app + generator + templates) | ~13,800 lines of Python |
+| Repository tests | **363** (~5,000 lines) |
+| Full suite with the generated examples | 392 tests (`shop.yaml`) and 398 (`cursos.yaml`), all green |
+| Dependency vulnerabilities (`pip-audit`) | **0** |
+| Load: 500 users, 60 s | 1,712 req/s, 38 ms median, **0 errors** |
+| Load with hostile traffic + rate limiting | ~80,000 requests, **0 failures, 0 5xx** |
+| Open critical/high findings | **0** |
 
 ## Stack
 
-Python 3.12+ · FastAPI · SQLModel / SQLAlchemy 2 async · Alembic · PostgreSQL / SQLite · Redis · PyJWT · pwdlib (Argon2id) · SlowAPI / limits · cryptography · Typer · Jinja2 · uv · ruff · pytest · Locust · Docker · GitHub Actions · Claude Code + agentes · graphify
+Python 3.12+ · FastAPI · SQLModel / SQLAlchemy 2 async · Alembic · PostgreSQL / SQLite · Redis · PyJWT · pwdlib (Argon2id) · SlowAPI / limits · cryptography · Typer · Jinja2 · uv · ruff · pytest · Locust · Docker · GitHub Actions · Claude Code + agents · graphify
 
-## Inicio rápido
+## Quick start
 
 ```bash
 uv sync
-uv run apigen init-env                        # .env con secretos aleatorios
+uv run apigen init-env                        # .env with random secrets
 uv run apigen generate examples/shop.yaml --migrate
 uv run apigen createsuperuser --email admin@example.com
 uv run apigen run                             # http://127.0.0.1:8000/docs
 uv run pytest -q
 ```
 
-En producción: `docker compose up -d --build` (API, worker, PostgreSQL y Redis).
+In production: `docker compose up -d --build` (API, worker, PostgreSQL and Redis).
 
-## Estructura
+## Layout
 
 ```
-apigen/          generador y CLI (spec, codegen, plantillas Jinja, docs, inventario)
-app/             API base: auth, usuarios, cuentas, correo, cola de trabajos, privacidad
-tests/           tests del núcleo y del generador
-examples/        specs de ejemplo (tienda, plataforma de cursos)
-security/        informes de las rondas, scripts de verificación y laboratorio
-docs/            cumplimiento SOC 2 / ISO 27701, inventario de datos, Postman
-.claude/agents/  definición de los agentes de IA (security-expert, developer, user)
-loadtests/       pruebas de carga con Locust
+apigen/          generator and CLI (spec, codegen, Jinja templates, docs, inventory)
+app/             base API: auth, users, accounts, email, job queue, privacy
+tests/           core and generator tests
+examples/        example specs (online shop, course platform)
+security/        review reports, verification scripts and lab
+docs/            SOC 2 / ISO 27701 compliance, data inventory, Postman
+.claude/agents/  AI agent definitions (security-expert, developer, user)
+loadtests/       Locust load tests
 ```
 
-## Documentación
+## Documentation
 
-- [`README.txt`](README.txt): manual técnico completo de la plantilla.
-- [`guia/README.txt`](guia/README.txt): guía práctica de uso.
-- [`security/REVISION_SEGURIDAD.md`](security/REVISION_SEGURIDAD.md): resumen de todas las rondas de revisión.
-- [`docs/CUMPLIMIENTO_SOC2_ISO27701.md`](docs/CUMPLIMIENTO_SOC2_ISO27701.md): controles, evidencias y responsabilidad del operador.
+The internal documentation and the CLI are in Spanish; the generated APIs and their client docs are in English (or Spanish).
 
-## Limitaciones conocidas
+- [`README.txt`](README.txt): full technical manual for the template.
+- [`guia/README.txt`](guia/README.txt): practical usage guide.
+- [`security/REVISION_SEGURIDAD.md`](security/REVISION_SEGURIDAD.md): summary of every review round.
+- [`docs/CUMPLIMIENTO_SOC2_ISO27701.md`](docs/CUMPLIMIENTO_SOC2_ISO27701.md): controls, evidence and operator responsibilities.
 
-- SOC 2 e ISO 27701 certifican **organizaciones**, no código. Esta plantilla aporta los controles técnicos y las evidencias; las políticas, los contratos con encargados, los backups y el SIEM son responsabilidad del operador (detallado en la matriz).
-- Pendiente: validar en vivo Redis con contraseña en Docker y fijar las imágenes y acciones de CI por digest.
+## Known limitations
+
+- SOC 2 and ISO 27701 certify **organizations**, not code. This template provides the technical controls and the evidence; policies, processor agreements, backups and the SIEM are the operator's responsibility (detailed in the matrix).
+- Pending: live validation of password-protected Redis under Docker, and pinning images and CI actions by digest.
 
 ---
 
-Autor: **sergionvte** · Desarrollado con [Claude Code](https://claude.com/claude-code) y agentes de IA especializados.
+Author: **sergionvte** · Built with [Claude Code](https://claude.com/claude-code) and specialized AI agents.

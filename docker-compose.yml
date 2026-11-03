@@ -93,7 +93,7 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     # La contraseña llega por entorno (no en la línea de órdenes del compose); REDISCLI_AUTH
     # evita pasarla con -a en el healthcheck.
     environment:
